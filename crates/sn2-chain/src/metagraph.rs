@@ -227,29 +227,65 @@ impl Metagraph {
         storage: &Storage<PolkadotConfig, OnlineClient<PolkadotConfig>>,
         n: u16,
     ) -> Result<Vec<NeuronInfo>> {
-        let validator_permits = query_validator_permits(storage, self.netuid)
-            .await
-            .map_err(|e| {
-                warn!(
-                    netuid = self.netuid,
-                    error = %e,
-                    "validator permits not updated"
-                );
-                e
-            })?;
-
         let netuid = self.netuid;
+        let (
+            validator_permits,
+            ranks,
+            trusts,
+            consensuses,
+            incentives,
+            dividends_vec,
+            emissions,
+            actives,
+            last_updates,
+        ) = tokio::join!(
+            query_vec::<bool>(storage, "ValidatorPermit", netuid),
+            query_vec::<u16>(storage, "Rank", netuid),
+            query_vec::<u16>(storage, "Trust", netuid),
+            query_vec::<u16>(storage, "Consensus", netuid),
+            query_vec::<u16>(storage, "Incentive", netuid),
+            query_vec::<u16>(storage, "Dividends", netuid),
+            query_vec::<u64>(storage, "Emission", netuid),
+            query_vec::<bool>(storage, "Active", netuid),
+            query_vec::<u64>(storage, "LastUpdate", netuid),
+        );
+
+        let validator_permits = validator_permits.unwrap_or_default();
+        let ranks = ranks.unwrap_or_default();
+        let trusts = trusts.unwrap_or_default();
+        let consensuses = consensuses.unwrap_or_default();
+        let incentives = incentives.unwrap_or_default();
+        let dividends_vec = dividends_vec.unwrap_or_default();
+        let emissions = emissions.unwrap_or_default();
+        let actives = actives.unwrap_or_default();
+        let last_updates = last_updates.unwrap_or_default();
+
         let neurons: Vec<Option<NeuronInfo>> = stream::iter(0..n)
             .map(|uid| {
                 let storage = storage;
                 let validator_permits = &validator_permits;
+                let ranks = &ranks;
+                let trusts = &trusts;
+                let consensuses = &consensuses;
+                let incentives = &incentives;
+                let dividends_vec = &dividends_vec;
+                let emissions = &emissions;
+                let actives = &actives;
+                let last_updates = &last_updates;
                 async move {
-                    match query_neuron(storage, netuid, uid).await {
+                    let idx = uid as usize;
+                    match query_neuron_core(storage, netuid, uid).await {
                         Ok(mut neuron) => {
-                            neuron.validator_permit = validator_permits
-                                .get(uid as usize)
-                                .copied()
-                                .unwrap_or(false);
+                            neuron.validator_permit =
+                                validator_permits.get(idx).copied().unwrap_or(false);
+                            neuron.rank = ranks.get(idx).copied().unwrap_or(0);
+                            neuron.trust = trusts.get(idx).copied().unwrap_or(0);
+                            neuron.consensus = consensuses.get(idx).copied().unwrap_or(0);
+                            neuron.incentive = incentives.get(idx).copied().unwrap_or(0);
+                            neuron.dividends = dividends_vec.get(idx).copied().unwrap_or(0);
+                            neuron.emission = emissions.get(idx).copied().unwrap_or(0);
+                            neuron.is_active = actives.get(idx).copied().unwrap_or(false);
+                            neuron.last_update = last_updates.get(idx).copied().unwrap_or(0);
                             debug!(uid = uid, hotkey = %neuron.hotkey, "synced neuron");
                             Some(neuron)
                         }
@@ -349,72 +385,20 @@ async fn query_subnet_n(
     }
 }
 
-async fn query_neuron(
+async fn query_neuron_core(
     storage: &Storage<PolkadotConfig, OnlineClient<PolkadotConfig>>,
     netuid: u16,
     uid: u16,
 ) -> Result<NeuronInfo> {
     let (hotkey_bytes, hotkey) = query_hotkey(storage, netuid, uid).await?;
 
-    let (
-        coldkey,
-        stake,
-        rank,
-        trust,
-        consensus,
-        incentive,
-        dividends,
-        emission,
-        is_active,
-        last_update,
-        axon,
-    ) = tokio::join!(
+    let (coldkey, stake, axon) = tokio::join!(
         async {
             query_coldkey(storage, &hotkey_bytes)
                 .await
                 .unwrap_or_default()
         },
         async { query_stake(storage, &hotkey_bytes).await.unwrap_or(0) },
-        async {
-            query_u16_field(storage, "Rank", netuid, uid)
-                .await
-                .unwrap_or(0)
-        },
-        async {
-            query_u16_field(storage, "Trust", netuid, uid)
-                .await
-                .unwrap_or(0)
-        },
-        async {
-            query_u16_field(storage, "Consensus", netuid, uid)
-                .await
-                .unwrap_or(0)
-        },
-        async {
-            query_u16_field(storage, "Incentive", netuid, uid)
-                .await
-                .unwrap_or(0)
-        },
-        async {
-            query_u16_field(storage, "Dividends", netuid, uid)
-                .await
-                .unwrap_or(0)
-        },
-        async {
-            query_u64_field(storage, "Emission", netuid, uid)
-                .await
-                .unwrap_or(0)
-        },
-        async {
-            query_bool_field(storage, "Active", netuid, uid)
-                .await
-                .unwrap_or(false)
-        },
-        async {
-            query_u64_field(storage, "LastUpdate", netuid, uid)
-                .await
-                .unwrap_or(0)
-        },
         async {
             query_axon(storage, netuid, &hotkey_bytes)
                 .await
@@ -428,14 +412,14 @@ async fn query_neuron(
         coldkey,
         hotkey_bytes,
         stake,
-        rank,
-        trust,
-        consensus,
-        incentive,
-        dividends,
-        emission,
-        is_active,
-        last_update,
+        rank: 0,
+        trust: 0,
+        consensus: 0,
+        incentive: 0,
+        dividends: 0,
+        emission: 0,
+        is_active: false,
+        last_update: 0,
         axon_ip: axon.0,
         axon_port: axon.1,
         axon_protocol: axon.2,
@@ -497,63 +481,24 @@ async fn query_stake(
     }
 }
 
-async fn query_u16_field(
+async fn query_vec<T: subxt::ext::scale_decode::IntoVisitor>(
     storage: &Storage<PolkadotConfig, OnlineClient<PolkadotConfig>>,
     storage_name: &str,
     netuid: u16,
-    uid: u16,
-) -> Result<u16> {
+) -> Result<Vec<T>> {
     let query = subxt::dynamic::storage(
         "SubtensorModule",
         storage_name,
-        vec![Value::from(netuid as u64), Value::from(uid as u64)],
+        vec![Value::from(netuid as u64)],
     );
 
     let result = storage.fetch(&query).await?;
 
     match result {
-        Some(val) => Ok(val.to_value()?.as_u128().unwrap_or(0) as u16),
-        None => Ok(0),
-    }
-}
-
-async fn query_u64_field(
-    storage: &Storage<PolkadotConfig, OnlineClient<PolkadotConfig>>,
-    storage_name: &str,
-    netuid: u16,
-    uid: u16,
-) -> Result<u64> {
-    let query = subxt::dynamic::storage(
-        "SubtensorModule",
-        storage_name,
-        vec![Value::from(netuid as u64), Value::from(uid as u64)],
-    );
-
-    let result = storage.fetch(&query).await?;
-
-    match result {
-        Some(val) => Ok(val.to_value()?.as_u128().unwrap_or(0) as u64),
-        None => Ok(0),
-    }
-}
-
-async fn query_bool_field(
-    storage: &Storage<PolkadotConfig, OnlineClient<PolkadotConfig>>,
-    storage_name: &str,
-    netuid: u16,
-    uid: u16,
-) -> Result<bool> {
-    let query = subxt::dynamic::storage(
-        "SubtensorModule",
-        storage_name,
-        vec![Value::from(netuid as u64), Value::from(uid as u64)],
-    );
-
-    let result = storage.fetch(&query).await?;
-
-    match result {
-        Some(val) => Ok(val.to_value()?.as_bool().unwrap_or(false)),
-        None => Ok(false),
+        Some(val) => val
+            .as_type::<Vec<T>>()
+            .with_context(|| format!("decoding {storage_name} vec")),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -588,25 +533,5 @@ async fn query_axon(
             Ok((ip, port, protocol))
         }
         None => Ok((String::new(), 0, 0)),
-    }
-}
-
-async fn query_validator_permits(
-    storage: &Storage<PolkadotConfig, OnlineClient<PolkadotConfig>>,
-    netuid: u16,
-) -> Result<Vec<bool>> {
-    let query = subxt::dynamic::storage(
-        "SubtensorModule",
-        "ValidatorPermit",
-        vec![Value::from(netuid as u64)],
-    );
-
-    let result = storage.fetch(&query).await?;
-
-    match result {
-        Some(val) => val
-            .as_type::<Vec<bool>>()
-            .context("decoding ValidatorPermit"),
-        None => Ok(Vec::new()),
     }
 }
