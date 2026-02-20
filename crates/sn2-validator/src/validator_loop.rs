@@ -174,6 +174,7 @@ pub struct ValidatorLoop {
     upload_tasks: JoinSet<()>,
     pending_reveal: Option<PendingReveal>,
     weight_tasks: JoinSet<WeightTaskResult>,
+    dsperse_benchmark_backoff_until: Instant,
 }
 
 impl ValidatorLoop {
@@ -256,6 +257,7 @@ impl ValidatorLoop {
             upload_tasks: JoinSet::new(),
             pending_reveal: None,
             weight_tasks: JoinSet::new(),
+            dsperse_benchmark_backoff_until: now,
         })
     }
 
@@ -604,6 +606,9 @@ impl ValidatorLoop {
         if self.config.disable_benchmark || self.run_manager.has_benchmark_runs() {
             return;
         }
+        if Instant::now() < self.dsperse_benchmark_backoff_until {
+            return;
+        }
         let dsperse_circuits = self.circuit_store.get_dsperse_circuits();
         if dsperse_circuits.is_empty() {
             return;
@@ -629,6 +634,7 @@ impl ValidatorLoop {
             Ok(result) => {
                 if let Some(err) = result.get("error") {
                     warn!(error = %err, "dsperse benchmark run returned error");
+                    self.dsperse_benchmark_backoff_until = Instant::now() + Duration::from_secs(60);
                     return;
                 }
                 let run_uid = result
@@ -651,6 +657,7 @@ impl ValidatorLoop {
             }
             Err(e) => {
                 warn!(error = %e, "failed to start dsperse benchmark run");
+                self.dsperse_benchmark_backoff_until = Instant::now() + Duration::from_secs(60);
             }
         }
     }
