@@ -1501,7 +1501,12 @@ impl ValidatorLoop {
         if now.duration_since(self.last_weight_update)
             > Duration::from_secs(WEIGHT_UPDATE_POLL_SECS)
         {
-            self.update_weights().await?;
+            match self.update_weights().await {
+                Ok(()) => {}
+                Err(e) => {
+                    warn!(error = ?e, "weight update failed, will retry next cycle");
+                }
+            }
             self.last_weight_update = now;
         }
 
