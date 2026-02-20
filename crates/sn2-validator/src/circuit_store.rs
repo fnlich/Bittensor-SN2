@@ -48,12 +48,21 @@ impl CircuitStore {
 
         for circuit_data in &api_circuits {
             if let Some(id) = circuit_data.get("id").and_then(|v| v.as_str()) {
-                if self.circuits.contains_key(id) || IGNORED_MODEL_HASHES.contains(&id) {
+                if IGNORED_MODEL_HASHES.contains(&id) {
+                    continue;
+                }
+                let is_loaded = self.circuits.contains_key(id);
+                let is_dsperse = self.circuits.get(id).is_some_and(|c| {
+                    c.metadata.circuit_type == CircuitType::DSPERSE_PROOF_GENERATION
+                });
+                if is_loaded && !is_dsperse {
                     continue;
                 }
                 match self.cache_and_load_circuit(id, circuit_data).await {
                     Ok(circuit) => {
-                        info!(id = id, name = %circuit.metadata.name, "loaded circuit from API");
+                        if !is_loaded {
+                            info!(id = id, name = %circuit.metadata.name, "loaded circuit from API");
+                        }
                         self.circuits.insert(id.to_string(), circuit);
                     }
                     Err(e) => {
@@ -215,10 +224,17 @@ impl CircuitStore {
                 std::fs::create_dir_all(&slices_dir).ok();
             }
             for (filename, url_val) in files {
-                if SKIP_AUTO_DOWNLOAD.contains(&filename.as_str()) {
+                let skip = if is_dsperse {
+                    filename == "full_model.onnx"
+                } else {
+                    SKIP_AUTO_DOWNLOAD.contains(&filename.as_str())
+                };
+                if skip {
                     continue;
                 }
-                let dest = if is_dsperse && filename.ends_with(".dslice") {
+                let dest = if is_dsperse
+                    && (filename.ends_with(".dslice") || filename == "metadata.json")
+                {
                     cache_path.join("slices").join(filename)
                 } else {
                     cache_path.join(filename)

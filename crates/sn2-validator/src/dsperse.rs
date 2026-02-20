@@ -240,7 +240,7 @@ fn build_benchmark_payload(
 
     write!(
         buf,
-        r#"{{"method":"start_incremental_run","circuit_id":"{}","inputs":{{"input_data":["#,
+        r#"{{"method":"start_incremental_run","circuit_id":"{}","inputs":{{"input_data":[["#,
         circuit_id,
     )?;
 
@@ -251,7 +251,7 @@ fn build_benchmark_payload(
         buf.extend_from_slice(b"0.0");
     }
 
-    write!(buf, r#"]}},"run_source":"benchmark","max_tiles":"#)?;
+    write!(buf, r#"]]}},"run_source":"benchmark","max_tiles":"#)?;
     match max_tiles {
         Some(mt) => write!(buf, "{mt}")?,
         None => write!(buf, "null")?,
