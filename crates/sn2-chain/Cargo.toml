@@ -18,3 +18,4 @@ bittensor_wallet = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
 semver = { workspace = true }
+openssl = { workspace = true }
