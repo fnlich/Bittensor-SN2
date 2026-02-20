@@ -1758,11 +1758,23 @@ impl ValidatorLoop {
             return Ok(());
         }
 
-        let cr_enabled = self
+        let cr_enabled = match self
             .weights_setter
             .commit_reveal_enabled(&self.config.chain_client)
             .await
-            .unwrap_or(false);
+        {
+            Ok(v) => {
+                info!(
+                    commit_reveal_enabled = v,
+                    "queried CommitRevealWeightsEnabled"
+                );
+                v
+            }
+            Err(e) => {
+                warn!(error = %e, "CommitRevealWeightsEnabled query failed, assuming enabled");
+                true
+            }
+        };
 
         if cr_enabled {
             let salt: Vec<u16> = (0..weight_uids.len())
