@@ -24,6 +24,13 @@ use crate::response_processor::ResponseProcessor;
 use crate::scoring::ScoreManager;
 use crate::{metrics_server, metrics_server as metrics};
 
+enum WeightTaskResult {
+    Committed(PendingReveal),
+    CommitFailed(String),
+    Revealed,
+    RevealFailed(String),
+}
+
 struct PowItem {
     miner_uid: u16,
     validator_uid: u16,
@@ -166,6 +173,7 @@ pub struct ValidatorLoop {
     benchmark_in_flight: usize,
     upload_tasks: JoinSet<()>,
     pending_reveal: Option<PendingReveal>,
+    weight_tasks: JoinSet<WeightTaskResult>,
 }
 
 impl ValidatorLoop {
@@ -247,6 +255,7 @@ impl ValidatorLoop {
             benchmark_in_flight: 0,
             upload_tasks: JoinSet::new(),
             pending_reveal: None,
+            weight_tasks: JoinSet::new(),
         })
     }
 
@@ -1502,12 +1511,40 @@ impl ValidatorLoop {
     async fn run_periodic_tasks(&mut self) -> Result<()> {
         let now = Instant::now();
 
+        while let Some(result) = self.weight_tasks.try_join_next() {
+            match result {
+                Ok(WeightTaskResult::Committed(pending)) => {
+                    info!(
+                        commit_block = pending.commit_block,
+                        "weight commit submitted, awaiting reveal window"
+                    );
+                    self.pending_reveal = Some(pending);
+                }
+                Ok(WeightTaskResult::CommitFailed(e)) => {
+                    warn!(error = %e, "weight commit failed");
+                }
+                Ok(WeightTaskResult::Revealed) => {
+                    self.performance_tracker.save();
+                    metrics::record_weight_update();
+                    info!("weights revealed on chain");
+                }
+                Ok(WeightTaskResult::RevealFailed(e)) => {
+                    warn!(error = %e, "weight reveal failed");
+                }
+                Err(e) => {
+                    warn!(error = %e, "weight task panicked");
+                }
+            }
+        }
+
         if now.duration_since(self.last_metagraph_sync) > Duration::from_secs(3600) {
             self.sync_metagraph().await?;
             self.last_metagraph_sync = now;
         }
 
-        if self.pending_reveal.is_some() {
+        let weight_op_in_flight = !self.weight_tasks.is_empty();
+
+        if self.pending_reveal.is_some() && !weight_op_in_flight {
             if let Err(e) = self.try_reveal_weights().await {
                 warn!(error = ?e, "weight reveal failed, will retry next cycle");
             }
@@ -1516,7 +1553,7 @@ impl ValidatorLoop {
         if now.duration_since(self.last_weight_update)
             > Duration::from_secs(WEIGHT_UPDATE_POLL_SECS)
         {
-            if self.pending_reveal.is_none() {
+            if self.pending_reveal.is_none() && !weight_op_in_flight {
                 match self.update_weights().await {
                     Ok(()) => {}
                     Err(e) => {
@@ -1693,21 +1730,27 @@ impl ValidatorLoop {
         }
 
         let reveal = self.pending_reveal.take().unwrap();
-        self.weights_setter
-            .reveal_weights(
-                &self.config.chain_client,
-                &self.config.wallet,
-                &reveal.uids,
-                &reveal.values,
-                &reveal.salt,
-                reveal.version_key,
-            )
-            .await
-            .context("revealing weights on chain")?;
+        let setter = self.weights_setter.clone();
+        let client = self.config.chain_client.clone();
+        let wallet = self.config.wallet.clone();
 
-        self.performance_tracker.save();
-        metrics::record_weight_update();
-        info!(uids = reveal.uids.len(), "weights revealed on chain");
+        self.weight_tasks.spawn(async move {
+            match setter
+                .reveal_weights(
+                    &client,
+                    &wallet,
+                    &reveal.uids,
+                    &reveal.values,
+                    &reveal.salt,
+                    reveal.version_key,
+                )
+                .await
+            {
+                Ok(()) => WeightTaskResult::Revealed,
+                Err(e) => WeightTaskResult::RevealFailed(e.to_string()),
+            }
+        });
+
         Ok(())
     }
 
@@ -1780,25 +1823,24 @@ impl ValidatorLoop {
             version_key,
         );
 
-        let commit_block = self
-            .weights_setter
-            .commit_weights(&self.config.chain_client, &self.config.wallet, &hash)
-            .await
-            .context("committing weights on chain")?;
+        let setter = self.weights_setter.clone();
+        let client = self.config.chain_client.clone();
+        let wallet = self.config.wallet.clone();
 
-        self.pending_reveal = Some(PendingReveal {
-            uids: weight_uids,
-            values: weights,
-            salt,
-            version_key,
-            commit_block,
+        self.weight_tasks.spawn(async move {
+            match setter.commit_weights(&client, &wallet, &hash).await {
+                Ok(commit_block) => WeightTaskResult::Committed(PendingReveal {
+                    uids: weight_uids,
+                    values: weights,
+                    salt,
+                    version_key,
+                    commit_block,
+                }),
+                Err(e) => WeightTaskResult::CommitFailed(e.to_string()),
+            }
         });
 
-        info!(
-            commit_block = commit_block,
-            "weight commit submitted, awaiting reveal window"
-        );
-
+        info!("weight commit spawned");
         Ok(())
     }
 

@@ -18,6 +18,7 @@ pub struct PendingReveal {
     pub commit_block: u64,
 }
 
+#[derive(Clone)]
 pub struct WeightsSetter {
     netuid: u16,
 }
