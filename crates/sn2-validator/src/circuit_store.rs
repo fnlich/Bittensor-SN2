@@ -143,6 +143,14 @@ impl CircuitStore {
             .collect()
     }
 
+    pub fn get_dsperse_circuits(&self) -> Vec<Circuit> {
+        self.circuits
+            .values()
+            .filter(|c| c.metadata.circuit_type == CircuitType::DSPERSE_PROOF_GENERATION)
+            .cloned()
+            .collect()
+    }
+
     pub fn get_circuit(&self, circuit_id: &str) -> Option<&Circuit> {
         self.circuits.get(circuit_id)
     }
@@ -199,12 +207,22 @@ impl CircuitStore {
         )
         .context("writing metadata")?;
 
+        let is_dsperse = metadata.circuit_type == CircuitType::DSPERSE_PROOF_GENERATION;
+
         if let Some(files) = data.get("files").and_then(|v| v.as_object()) {
+            if is_dsperse {
+                let slices_dir = cache_path.join("slices");
+                std::fs::create_dir_all(&slices_dir).ok();
+            }
             for (filename, url_val) in files {
                 if SKIP_AUTO_DOWNLOAD.contains(&filename.as_str()) {
                     continue;
                 }
-                let dest = cache_path.join(filename);
+                let dest = if is_dsperse && filename.ends_with(".dslice") {
+                    cache_path.join("slices").join(filename)
+                } else {
+                    cache_path.join(filename)
+                };
                 if dest.exists() {
                     continue;
                 }
@@ -260,6 +278,9 @@ impl CircuitStore {
 
             match load_circuit_from_cache(&circuit_id, &entry.path(), &self.cache_dir) {
                 Ok(circuit) => {
+                    if circuit.metadata.circuit_type == CircuitType::DSPERSE_PROOF_GENERATION {
+                        migrate_dslice_layout(&entry.path());
+                    }
                     self.circuits.insert(circuit_id, circuit);
                 }
                 Err(e) => {
@@ -313,6 +334,38 @@ fn load_settings(dir: &Path) -> HashMap<String, serde_json::Value> {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+fn migrate_dslice_layout(model_dir: &Path) {
+    let slices_dir = model_dir.join("slices");
+    if slices_dir.exists() {
+        return;
+    }
+    let entries = match std::fs::read_dir(model_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let dslice_files: Vec<_> = entries
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".dslice"))
+        .collect();
+    if dslice_files.is_empty() {
+        return;
+    }
+    if std::fs::create_dir_all(&slices_dir).is_err() {
+        return;
+    }
+    for entry in dslice_files {
+        let dest = slices_dir.join(entry.file_name());
+        if let Err(e) = std::fs::rename(entry.path(), &dest) {
+            warn!(
+                file = %entry.file_name().to_string_lossy(),
+                error = %e,
+                "failed to migrate dslice file to slices/"
+            );
+        }
+    }
+    info!(dir = %model_dir.display(), "migrated dslice files to slices/ subdirectory");
 }
 
 fn parse_proof_system(s: &str) -> ProofSystem {

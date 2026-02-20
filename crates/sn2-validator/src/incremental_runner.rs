@@ -92,6 +92,12 @@ impl IncrementalRunManager {
         self.runs.len()
     }
 
+    pub fn has_benchmark_runs(&self) -> bool {
+        self.runs
+            .values()
+            .any(|r| r.run_source == RunSource::Benchmark)
+    }
+
     pub fn gc_stale(&mut self, max_age: Duration) -> Vec<String> {
         let now = Instant::now();
         let stale: Vec<String> = self

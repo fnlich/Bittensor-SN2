@@ -1,6 +1,12 @@
+use std::collections::HashMap;
+use std::io::Write;
+
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+const BENCHMARK_RUN_TIMEOUT_SECS: u64 = 300;
 
 pub struct DSperseManager {
     socket_path: Option<String>,
@@ -27,6 +33,17 @@ impl DSperseManager {
         });
 
         self.send_ipc(&request).await
+    }
+
+    pub async fn start_benchmark_run(
+        &self,
+        circuit_id: &str,
+        input_schema: &HashMap<String, serde_json::Value>,
+        max_tiles: Option<u32>,
+    ) -> Result<serde_json::Value> {
+        let payload = build_benchmark_payload(circuit_id, input_schema, max_tiles)?;
+        self.send_and_receive(&payload, BENCHMARK_RUN_TIMEOUT_SECS)
+            .await
     }
 
     pub async fn get_run_status(&self, run_uid: &str) -> Result<serde_json::Value> {
@@ -150,27 +167,35 @@ impl DSperseManager {
     }
 
     async fn send_ipc(&self, request: &serde_json::Value) -> Result<serde_json::Value> {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            self.send_ipc_inner(request),
-        )
-        .await
-        .context("dsperse IPC timed out after 30s")?
+        let payload = serde_json::to_vec(request)?;
+        self.send_and_receive(&payload, DEFAULT_TIMEOUT_SECS).await
     }
 
-    async fn send_ipc_inner(&self, request: &serde_json::Value) -> Result<serde_json::Value> {
+    async fn send_and_receive(
+        &self,
+        payload: &[u8],
+        timeout_secs: u64,
+    ) -> Result<serde_json::Value> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            self.send_and_receive_inner(payload),
+        )
+        .await
+        .with_context(|| format!("dsperse IPC timed out after {timeout_secs}s"))?
+    }
+
+    async fn send_and_receive_inner(&self, payload: &[u8]) -> Result<serde_json::Value> {
         let socket_path = self.socket_path.as_deref().unwrap_or("/tmp/dsperse.sock");
 
         let mut stream = UnixStream::connect(socket_path)
             .await
             .with_context(|| format!("connecting to dsperse at {socket_path}"))?;
 
-        let payload = serde_json::to_vec(request)?;
         let len = u32::try_from(payload.len())
             .context("IPC payload exceeds u32::MAX")?
             .to_be_bytes();
         stream.write_all(&len).await?;
-        stream.write_all(&payload).await?;
+        stream.write_all(payload).await?;
         stream.flush().await?;
 
         let mut len_buf = [0u8; 4];
@@ -187,4 +212,51 @@ impl DSperseManager {
         let response: serde_json::Value = serde_json::from_slice(&resp_buf)?;
         Ok(response)
     }
+}
+
+fn build_benchmark_payload(
+    circuit_id: &str,
+    input_schema: &HashMap<String, serde_json::Value>,
+    max_tiles: Option<u32>,
+) -> Result<Vec<u8>> {
+    let total_elements: usize = input_schema
+        .get("shape")
+        .and_then(|v| v.as_array())
+        .map(|dims| {
+            dims.iter()
+                .filter_map(|d| d.as_u64())
+                .map(|d| d as usize)
+                .product()
+        })
+        .unwrap_or(0);
+
+    anyhow::ensure!(
+        total_elements > 0,
+        "cannot derive tensor size from input_schema"
+    );
+
+    let zeros_json_len = total_elements * 4; // "0.0," per element
+    let mut buf = Vec::with_capacity(256 + zeros_json_len);
+
+    write!(
+        buf,
+        r#"{{"method":"start_incremental_run","circuit_id":"{}","inputs":{{"input_data":["#,
+        circuit_id,
+    )?;
+
+    for i in 0..total_elements {
+        if i > 0 {
+            buf.push(b',');
+        }
+        buf.extend_from_slice(b"0.0");
+    }
+
+    write!(buf, r#"]}},"run_source":"benchmark","max_tiles":"#)?;
+    match max_tiles {
+        Some(mt) => write!(buf, "{mt}")?,
+        None => write!(buf, "null")?,
+    }
+    buf.push(b'}');
+
+    Ok(buf)
 }

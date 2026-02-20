@@ -598,6 +598,60 @@ impl ValidatorLoop {
         if item_count > 0 {
             info!(count = item_count, "replenished dslice queues from dsperse");
             self.dispatch_notify.notify_one();
+            return;
+        }
+
+        if self.config.disable_benchmark || self.run_manager.has_benchmark_runs() {
+            return;
+        }
+        let dsperse_circuits = self.circuit_store.get_dsperse_circuits();
+        if dsperse_circuits.is_empty() {
+            return;
+        }
+        let idx = rand::Rng::gen_range(&mut rand::thread_rng(), 0..dsperse_circuits.len());
+        let circuit = &dsperse_circuits[idx];
+
+        let schema = match &circuit.metadata.input_schema {
+            Some(s) if !s.is_empty() => s.clone(),
+            _ => {
+                warn!(circuit = %circuit.id, "dsperse circuit has no input_schema, cannot benchmark");
+                return;
+            }
+        };
+
+        info!(circuit = %circuit.id, name = %circuit.metadata.name, "starting dsperse benchmark run");
+
+        match self
+            .dsperse
+            .start_benchmark_run(&circuit.id, &schema, Some(1))
+            .await
+        {
+            Ok(result) => {
+                if let Some(err) = result.get("error") {
+                    warn!(error = %err, "dsperse benchmark run returned error");
+                    return;
+                }
+                let run_uid = result
+                    .get("run_uid")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+
+                info!(run_uid = %run_uid, circuit = %circuit.id, "dsperse benchmark run started");
+
+                self.run_manager.start_run(
+                    run_uid.clone(),
+                    circuit.id.clone(),
+                    circuit.metadata.name.clone(),
+                    RunSource::Benchmark,
+                    None,
+                );
+
+                self.enqueue_dsperse_work(&run_uid, circuit).await;
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to start dsperse benchmark run");
+            }
         }
     }
 
@@ -1610,6 +1664,7 @@ impl ValidatorLoop {
         if now.duration_since(self.last_health_log) > Duration::from_secs(15) {
             let queryable_count = self.get_queryable_neurons().len();
             let benchmark_count = self.circuit_store.get_benchmark_circuits().len();
+            let dsperse_count = self.circuit_store.get_dsperse_circuits().len();
             info!(
                 active_tasks = self.tasks.len(),
                 rwr_queue = self.rwr_queue.len(),
@@ -1618,6 +1673,7 @@ impl ValidatorLoop {
                 active_runs = self.run_manager.active_count(),
                 queryable_neurons = queryable_count,
                 benchmark_circuits = benchmark_count,
+                dsperse_circuits = dsperse_count,
                 max_concurrency = self.config.max_concurrency,
                 benchmark_in_flight = self.benchmark_in_flight,
                 "health"
