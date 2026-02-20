@@ -1758,74 +1758,39 @@ impl ValidatorLoop {
             return Ok(());
         }
 
-        let cr_enabled = match self
+        let salt: Vec<u16> = (0..weight_uids.len())
+            .map(|_| rand::Rng::gen(&mut rand::thread_rng()))
+            .collect();
+        let version_key = WEIGHTS_VERSION as u64;
+
+        let hotkey_account = self.config.wallet.hotkey_account_id()?;
+        let hash = WeightsSetter::compute_commit_hash(
+            &hotkey_account,
+            self.config.netuid,
+            &weight_uids,
+            &weights,
+            &salt,
+            version_key,
+        );
+
+        let commit_block = self
             .weights_setter
-            .commit_reveal_enabled(&self.config.chain_client)
+            .commit_weights(&self.config.chain_client, &self.config.wallet, &hash)
             .await
-        {
-            Ok(v) => {
-                info!(
-                    commit_reveal_enabled = v,
-                    "queried CommitRevealWeightsEnabled"
-                );
-                v
-            }
-            Err(e) => {
-                warn!(error = %e, "CommitRevealWeightsEnabled query failed, assuming enabled");
-                true
-            }
-        };
+            .context("committing weights on chain")?;
 
-        if cr_enabled {
-            let salt: Vec<u16> = (0..weight_uids.len())
-                .map(|_| rand::Rng::gen(&mut rand::thread_rng()))
-                .collect();
-            let version_key = WEIGHTS_VERSION as u64;
+        self.pending_reveal = Some(PendingReveal {
+            uids: weight_uids,
+            values: weights,
+            salt,
+            version_key,
+            commit_block,
+        });
 
-            let hotkey_account = self.config.wallet.hotkey_account_id()?;
-            let hash = WeightsSetter::compute_commit_hash(
-                &hotkey_account,
-                self.config.netuid,
-                &weight_uids,
-                &weights,
-                &salt,
-                version_key,
-            );
-
-            let commit_block = self
-                .weights_setter
-                .commit_weights(&self.config.chain_client, &self.config.wallet, &hash)
-                .await
-                .context("committing weights on chain")?;
-
-            self.pending_reveal = Some(PendingReveal {
-                uids: weight_uids,
-                values: weights,
-                salt,
-                version_key,
-                commit_block,
-            });
-
-            info!(
-                commit_block = commit_block,
-                "weight commit submitted, awaiting reveal window"
-            );
-        } else {
-            self.weights_setter
-                .set_weights(
-                    &self.config.chain_client,
-                    &self.config.wallet,
-                    &weight_uids,
-                    &weights,
-                    WEIGHTS_VERSION,
-                )
-                .await
-                .context("setting weights on chain")?;
-
-            self.performance_tracker.save();
-            metrics::record_weight_update();
-            info!(uids = weight_uids.len(), "weights set on chain");
-        }
+        info!(
+            commit_block = commit_block,
+            "weight commit submitted, awaiting reveal window"
+        );
 
         Ok(())
     }
