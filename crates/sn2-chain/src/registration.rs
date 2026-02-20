@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use subxt::dynamic::Value;
+use subxt::ext::scale_value::At;
 use subxt::{OnlineClient, PolkadotConfig};
 use tracing::info;
 
@@ -38,6 +39,28 @@ impl Registration {
                 anyhow::bail!("IPv6 is not supported for axon registration");
             }
         };
+
+        let hotkey_bytes = wallet.hotkey_public_bytes()?;
+        let storage = client.storage().at_latest().await?;
+        let query = subxt::dynamic::storage(
+            "SubtensorModule",
+            "Axons",
+            vec![
+                Value::from(self.netuid as u64),
+                Value::from_bytes(hotkey_bytes),
+            ],
+        );
+        if let Some(val) = storage.fetch(&query).await? {
+            let v = val.to_value()?;
+            let chain_ip = v.at("ip").and_then(|v| v.as_u128()).unwrap_or(0) as u64;
+            let chain_port = v.at("port").and_then(|v| v.as_u128()).unwrap_or(0) as u16;
+            let chain_protocol = v.at("protocol").and_then(|v| v.as_u128()).unwrap_or(0) as u8;
+
+            if chain_ip == ip_int && chain_port == port && chain_protocol == protocol {
+                info!(ip = %ip, port = port, "axon already registered on chain, skipping");
+                return Ok(());
+            }
+        }
 
         let tx = subxt::dynamic::tx(
             "SubtensorModule",
