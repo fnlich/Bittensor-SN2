@@ -19,3 +19,5 @@ reqwest = { workspace = true }
 sha2 = { workspace = true }
 semver = { workspace = true }
 openssl = { workspace = true }
+futures-util = { workspace = true }
+parity-scale-codec = { version = "3", features = ["derive"] }

@@ -70,6 +70,19 @@ async fn main() -> Result<()> {
         .sync(&chain_client)
         .await
         .context("initial metagraph sync")?;
+
+    if metagraph.get_uid_by_hotkey(wallet.hotkey_ss58()).is_none() {
+        error!(
+            hotkey = %wallet.hotkey_ss58(),
+            netuid = cli.netuid,
+            network = %cli.network,
+            "Hotkey is not registered on subnet. Register with: btcli subnets register --netuid {} --network {}",
+            cli.netuid,
+            cli.network,
+        );
+        std::process::exit(1);
+    }
+
     let metagraph = Arc::new(RwLock::new(metagraph));
 
     let external_ip: std::net::IpAddr = cli

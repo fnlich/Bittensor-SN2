@@ -6136,8 +6136,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bittensor_wallet",
+ "futures-util",
  "hex",
  "openssl",
+ "parity-scale-codec",
  "reqwest",
  "semver",
  "serde",

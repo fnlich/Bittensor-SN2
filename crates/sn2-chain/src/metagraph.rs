@@ -1,11 +1,59 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
+use futures_util::stream::{self, StreamExt};
+use parity_scale_codec::{Compact, Decode, Encode};
 use sp_core::crypto::Ss58Codec;
 use subxt::dynamic::Value;
 use subxt::ext::scale_value::At;
+use subxt::storage::Storage;
 use subxt::{OnlineClient, PolkadotConfig};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+const METAGRAPH_SYNC_CONCURRENCY: usize = 32;
+
+#[derive(Decode)]
+struct AxonInfoRaw {
+    _block: u64,
+    _version: u32,
+    ip: u128,
+    port: u16,
+    ip_type: u8,
+    protocol: u8,
+    _placeholder1: u8,
+    _placeholder2: u8,
+}
+
+#[derive(Decode)]
+struct PrometheusInfoRaw {
+    _block: u64,
+    _version: u32,
+    _ip: u128,
+    _port: u16,
+    _ip_type: u8,
+}
+
+#[derive(Decode)]
+struct NeuronInfoLiteRaw {
+    hotkey: [u8; 32],
+    coldkey: [u8; 32],
+    uid: Compact<u16>,
+    _netuid: Compact<u16>,
+    active: bool,
+    axon_info: AxonInfoRaw,
+    _prometheus_info: PrometheusInfoRaw,
+    stake: Vec<([u8; 32], Compact<u64>)>,
+    rank: Compact<u16>,
+    emission: Compact<u64>,
+    incentive: Compact<u16>,
+    consensus: Compact<u16>,
+    trust: Compact<u16>,
+    _validator_trust: Compact<u16>,
+    dividends: Compact<u16>,
+    last_update: Compact<u64>,
+    validator_permit: bool,
+    _pruning_score: Compact<u16>,
+}
 
 #[derive(Debug, Clone)]
 pub struct NeuronInfo {
@@ -52,14 +100,20 @@ impl Metagraph {
     }
 
     pub async fn sync(&mut self, client: &OnlineClient<PolkadotConfig>) -> Result<()> {
-        let block = client
+        let block_ref = client
             .blocks()
             .at_latest()
             .await
             .context("fetching latest block")?;
-        self.block = block.number() as u64;
+        self.block = block_ref.number() as u64;
 
-        let n = self.query_subnet_n(client).await?;
+        let storage = client
+            .storage()
+            .at_latest()
+            .await
+            .context("fetching storage at latest block")?;
+
+        let n = query_subnet_n(&storage, self.netuid).await?;
         self.n = n;
 
         info!(
@@ -69,31 +123,24 @@ impl Metagraph {
             "syncing metagraph"
         );
 
-        let validator_permits = self.query_validator_permits(client).await.map_err(|e| {
-            warn!(
-                netuid = self.netuid,
-                error = %e,
-                "validator permits not updated"
-            );
-            e
-        })?;
-
-        let mut neurons = Vec::with_capacity(n as usize);
-
-        for uid in 0..n {
-            match self.query_neuron(client, uid).await {
-                Ok(mut neuron) => {
-                    neuron.validator_permit = validator_permits
-                        .get(uid as usize)
-                        .copied()
-                        .unwrap_or(false);
-                    neurons.push(neuron);
-                }
-                Err(e) => {
-                    warn!(uid = uid, error = %e, "skipping neuron");
-                }
+        let neurons = match self.sync_via_runtime_api(client).await {
+            Ok(neurons) => {
+                info!(
+                    netuid = self.netuid,
+                    neurons = neurons.len(),
+                    "synced via runtime API"
+                );
+                neurons
             }
-        }
+            Err(e) => {
+                warn!(
+                    netuid = self.netuid,
+                    error = %e,
+                    "runtime API unavailable, falling back to storage queries"
+                );
+                self.sync_via_storage(&storage, n).await?
+            }
+        };
 
         self.uid_to_idx.clear();
         self.hotkey_to_uid.clear();
@@ -117,276 +164,107 @@ impl Metagraph {
         Ok(())
     }
 
-    async fn query_subnet_n(&self, client: &OnlineClient<PolkadotConfig>) -> Result<u16> {
-        let query = subxt::dynamic::storage(
-            "SubtensorModule",
-            "SubnetworkN",
-            vec![Value::from(self.netuid as u64)],
-        );
-
-        let result = client.storage().at_latest().await?.fetch(&query).await?;
-
-        match result {
-            Some(val) => {
-                let n = val.to_value()?.as_u128().context("SubnetworkN not u128")? as u16;
-                Ok(n)
-            }
-            None => Ok(0),
-        }
-    }
-
-    async fn query_neuron(
+    async fn sync_via_runtime_api(
         &self,
         client: &OnlineClient<PolkadotConfig>,
-        uid: u16,
-    ) -> Result<NeuronInfo> {
-        let (hotkey_bytes, hotkey) = self.query_hotkey(client, uid).await?;
-        let coldkey = self
-            .query_coldkey(client, &hotkey_bytes)
-            .await
-            .unwrap_or_default();
-        let stake = self.query_stake(client, &hotkey_bytes).await.unwrap_or(0);
-        let rank = self
-            .query_u16_storage(client, "Rank", uid)
-            .await
-            .unwrap_or(0);
-        let trust = self
-            .query_u16_storage(client, "Trust", uid)
-            .await
-            .unwrap_or(0);
-        let consensus = self
-            .query_u16_storage(client, "Consensus", uid)
-            .await
-            .unwrap_or(0);
-        let incentive = self
-            .query_u16_storage(client, "Incentive", uid)
-            .await
-            .unwrap_or(0);
-        let dividends = self
-            .query_u16_storage(client, "Dividends", uid)
-            .await
-            .unwrap_or(0);
-        let emission = self
-            .query_u64_storage(client, "Emission", uid)
-            .await
-            .unwrap_or(0);
-        let is_active = self
-            .query_bool_storage(client, "Active", uid)
-            .await
-            .unwrap_or(false);
-        let last_update = self
-            .query_u64_storage(client, "LastUpdate", uid)
-            .await
-            .unwrap_or(0);
-        let (axon_ip, axon_port, axon_protocol) = self
-            .query_axon(client, &hotkey_bytes)
-            .await
-            .unwrap_or_default();
-
-        Ok(NeuronInfo {
-            uid,
-            hotkey,
-            coldkey,
-            hotkey_bytes,
-            stake,
-            rank,
-            trust,
-            consensus,
-            incentive,
-            dividends,
-            emission,
-            is_active,
-            last_update,
-            axon_ip,
-            axon_port,
-            axon_protocol,
-            validator_permit: false,
-        })
-    }
-
-    async fn query_hotkey(
-        &self,
-        client: &OnlineClient<PolkadotConfig>,
-        uid: u16,
-    ) -> Result<([u8; 32], String)> {
-        let query = subxt::dynamic::storage(
-            "SubtensorModule",
-            "Keys",
-            vec![Value::from(self.netuid as u64), Value::from(uid as u64)],
-        );
-
-        let result = client
-            .storage()
+    ) -> Result<Vec<NeuronInfo>> {
+        let params = Encode::encode(&self.netuid);
+        let items: Vec<NeuronInfoLiteRaw> = client
+            .runtime_api()
             .at_latest()
             .await?
-            .fetch(&query)
-            .await?
-            .context("hotkey not found")?;
+            .call_raw("NeuronInfoRuntimeApi_get_neurons_lite", Some(&params))
+            .await
+            .context("calling get_neurons_lite")?;
 
-        let account_id: subxt::utils::AccountId32 = result.as_type()?;
-        let bytes = account_id.0;
-        let ss58 = sp_core::crypto::AccountId32::new(bytes).to_ss58check();
-        Ok((bytes, ss58))
+        let neurons: Vec<NeuronInfo> = items
+            .into_iter()
+            .map(|raw| {
+                let hotkey = sp_core::crypto::AccountId32::new(raw.hotkey).to_ss58check();
+                let coldkey = sp_core::crypto::AccountId32::new(raw.coldkey).to_ss58check();
+                let total_stake: u64 = raw.stake.iter().map(|(_, s)| s.0).sum();
+
+                let ip_raw = raw.axon_info.ip as u32;
+                let axon_ip = if raw.axon_info.ip_type == 4 {
+                    format!(
+                        "{}.{}.{}.{}",
+                        (ip_raw >> 24) & 0xFF,
+                        (ip_raw >> 16) & 0xFF,
+                        (ip_raw >> 8) & 0xFF,
+                        ip_raw & 0xFF,
+                    )
+                } else {
+                    String::new()
+                };
+
+                NeuronInfo {
+                    uid: raw.uid.0,
+                    hotkey,
+                    coldkey,
+                    hotkey_bytes: raw.hotkey,
+                    stake: total_stake,
+                    rank: raw.rank.0,
+                    trust: raw.trust.0,
+                    consensus: raw.consensus.0,
+                    incentive: raw.incentive.0,
+                    dividends: raw.dividends.0,
+                    emission: raw.emission.0,
+                    is_active: raw.active,
+                    last_update: raw.last_update.0,
+                    axon_ip,
+                    axon_port: raw.axon_info.port,
+                    axon_protocol: raw.axon_info.protocol,
+                    validator_permit: raw.validator_permit,
+                }
+            })
+            .collect();
+
+        Ok(neurons)
     }
 
-    async fn query_coldkey(
+    async fn sync_via_storage(
         &self,
-        client: &OnlineClient<PolkadotConfig>,
-        hotkey_bytes: &[u8; 32],
-    ) -> Result<String> {
-        let query = subxt::dynamic::storage(
-            "SubtensorModule",
-            "Owner",
-            vec![Value::from_bytes(hotkey_bytes)],
-        );
-
-        let result = client
-            .storage()
-            .at_latest()
-            .await?
-            .fetch(&query)
-            .await?
-            .context("coldkey not found")?;
-
-        let account_id: subxt::utils::AccountId32 = result.as_type()?;
-        let ss58 = sp_core::crypto::AccountId32::new(account_id.0).to_ss58check();
-        Ok(ss58)
-    }
-
-    async fn query_stake(
-        &self,
-        client: &OnlineClient<PolkadotConfig>,
-        hotkey_bytes: &[u8; 32],
-    ) -> Result<u64> {
-        let query = subxt::dynamic::storage(
-            "SubtensorModule",
-            "TotalHotkeyStake",
-            vec![Value::from_bytes(hotkey_bytes)],
-        );
-
-        let result = client.storage().at_latest().await?.fetch(&query).await?;
-
-        match result {
-            Some(val) => Ok(val.to_value()?.as_u128().unwrap_or(0) as u64),
-            None => Ok(0),
-        }
-    }
-
-    async fn query_u16_storage(
-        &self,
-        client: &OnlineClient<PolkadotConfig>,
-        storage_name: &str,
-        uid: u16,
-    ) -> Result<u16> {
-        let query = subxt::dynamic::storage(
-            "SubtensorModule",
-            storage_name,
-            vec![Value::from(self.netuid as u64), Value::from(uid as u64)],
-        );
-
-        let result = client.storage().at_latest().await?.fetch(&query).await?;
-
-        match result {
-            Some(val) => Ok(val.to_value()?.as_u128().unwrap_or(0) as u16),
-            None => Ok(0),
-        }
-    }
-
-    async fn query_u64_storage(
-        &self,
-        client: &OnlineClient<PolkadotConfig>,
-        storage_name: &str,
-        uid: u16,
-    ) -> Result<u64> {
-        let query = subxt::dynamic::storage(
-            "SubtensorModule",
-            storage_name,
-            vec![Value::from(self.netuid as u64), Value::from(uid as u64)],
-        );
-
-        let result = client.storage().at_latest().await?.fetch(&query).await?;
-
-        match result {
-            Some(val) => Ok(val.to_value()?.as_u128().unwrap_or(0) as u64),
-            None => Ok(0),
-        }
-    }
-
-    async fn query_bool_storage(
-        &self,
-        client: &OnlineClient<PolkadotConfig>,
-        storage_name: &str,
-        uid: u16,
-    ) -> Result<bool> {
-        let query = subxt::dynamic::storage(
-            "SubtensorModule",
-            storage_name,
-            vec![Value::from(self.netuid as u64), Value::from(uid as u64)],
-        );
-
-        let result = client.storage().at_latest().await?.fetch(&query).await?;
-
-        match result {
-            Some(val) => Ok(val.to_value()?.as_bool().unwrap_or(false)),
-            None => Ok(false),
-        }
-    }
-
-    async fn query_axon(
-        &self,
-        client: &OnlineClient<PolkadotConfig>,
-        hotkey_bytes: &[u8; 32],
-    ) -> Result<(String, u16, u8)> {
-        let query = subxt::dynamic::storage(
-            "SubtensorModule",
-            "Axons",
-            vec![
-                Value::from(self.netuid as u64),
-                Value::from_bytes(hotkey_bytes),
-            ],
-        );
-
-        let result = client.storage().at_latest().await?.fetch(&query).await?;
-
-        match result {
-            Some(val) => {
-                let v = val.to_value()?;
-                let ip_raw = v.at("ip").and_then(|v| v.as_u128()).unwrap_or(0) as u32;
-                let port = v.at("port").and_then(|v| v.as_u128()).unwrap_or(0) as u16;
-                let protocol = v.at("protocol").and_then(|v| v.as_u128()).unwrap_or(0) as u8;
-
-                let ip = format!(
-                    "{}.{}.{}.{}",
-                    (ip_raw >> 24) & 0xFF,
-                    (ip_raw >> 16) & 0xFF,
-                    (ip_raw >> 8) & 0xFF,
-                    ip_raw & 0xFF,
+        storage: &Storage<PolkadotConfig, OnlineClient<PolkadotConfig>>,
+        n: u16,
+    ) -> Result<Vec<NeuronInfo>> {
+        let validator_permits = query_validator_permits(storage, self.netuid)
+            .await
+            .map_err(|e| {
+                warn!(
+                    netuid = self.netuid,
+                    error = %e,
+                    "validator permits not updated"
                 );
+                e
+            })?;
 
-                Ok((ip, port, protocol))
-            }
-            None => Ok((String::new(), 0, 0)),
-        }
-    }
+        let netuid = self.netuid;
+        let neurons: Vec<Option<NeuronInfo>> = stream::iter(0..n)
+            .map(|uid| {
+                let storage = storage;
+                let validator_permits = &validator_permits;
+                async move {
+                    match query_neuron(storage, netuid, uid).await {
+                        Ok(mut neuron) => {
+                            neuron.validator_permit = validator_permits
+                                .get(uid as usize)
+                                .copied()
+                                .unwrap_or(false);
+                            debug!(uid = uid, hotkey = %neuron.hotkey, "synced neuron");
+                            Some(neuron)
+                        }
+                        Err(e) => {
+                            warn!(uid = uid, error = %e, "skipping neuron");
+                            None
+                        }
+                    }
+                }
+            })
+            .buffer_unordered(METAGRAPH_SYNC_CONCURRENCY)
+            .collect()
+            .await;
 
-    async fn query_validator_permits(
-        &self,
-        client: &OnlineClient<PolkadotConfig>,
-    ) -> Result<Vec<bool>> {
-        let query = subxt::dynamic::storage(
-            "SubtensorModule",
-            "ValidatorPermit",
-            vec![Value::from(self.netuid as u64)],
-        );
-
-        let result = client.storage().at_latest().await?.fetch(&query).await?;
-
-        match result {
-            Some(val) => val
-                .as_type::<Vec<bool>>()
-                .context("decoding ValidatorPermit"),
-            None => Ok(Vec::new()),
-        }
+        Ok(neurons.into_iter().flatten().collect())
     }
 
     pub fn get_neuron(&self, uid: u16) -> Option<&NeuronInfo> {
@@ -430,13 +308,14 @@ impl Metagraph {
         &self,
         client: &OnlineClient<PolkadotConfig>,
     ) -> Result<Option<u16>> {
+        let storage = client.storage().at_latest().await?;
         let query = subxt::dynamic::storage(
             "SubtensorModule",
             "SubnetOwner",
             vec![Value::from(self.netuid as u64)],
         );
 
-        let result = client.storage().at_latest().await?.fetch(&query).await?;
+        let result = storage.fetch(&query).await?;
 
         match result {
             Some(val) => {
@@ -446,5 +325,288 @@ impl Metagraph {
             }
             None => Ok(None),
         }
+    }
+}
+
+async fn query_subnet_n(
+    storage: &Storage<PolkadotConfig, OnlineClient<PolkadotConfig>>,
+    netuid: u16,
+) -> Result<u16> {
+    let query = subxt::dynamic::storage(
+        "SubtensorModule",
+        "SubnetworkN",
+        vec![Value::from(netuid as u64)],
+    );
+
+    let result = storage.fetch(&query).await?;
+
+    match result {
+        Some(val) => {
+            let n = val.to_value()?.as_u128().context("SubnetworkN not u128")? as u16;
+            Ok(n)
+        }
+        None => Ok(0),
+    }
+}
+
+async fn query_neuron(
+    storage: &Storage<PolkadotConfig, OnlineClient<PolkadotConfig>>,
+    netuid: u16,
+    uid: u16,
+) -> Result<NeuronInfo> {
+    let (hotkey_bytes, hotkey) = query_hotkey(storage, netuid, uid).await?;
+
+    let (
+        coldkey,
+        stake,
+        rank,
+        trust,
+        consensus,
+        incentive,
+        dividends,
+        emission,
+        is_active,
+        last_update,
+        axon,
+    ) = tokio::join!(
+        async {
+            query_coldkey(storage, &hotkey_bytes)
+                .await
+                .unwrap_or_default()
+        },
+        async { query_stake(storage, &hotkey_bytes).await.unwrap_or(0) },
+        async {
+            query_u16_field(storage, "Rank", netuid, uid)
+                .await
+                .unwrap_or(0)
+        },
+        async {
+            query_u16_field(storage, "Trust", netuid, uid)
+                .await
+                .unwrap_or(0)
+        },
+        async {
+            query_u16_field(storage, "Consensus", netuid, uid)
+                .await
+                .unwrap_or(0)
+        },
+        async {
+            query_u16_field(storage, "Incentive", netuid, uid)
+                .await
+                .unwrap_or(0)
+        },
+        async {
+            query_u16_field(storage, "Dividends", netuid, uid)
+                .await
+                .unwrap_or(0)
+        },
+        async {
+            query_u64_field(storage, "Emission", netuid, uid)
+                .await
+                .unwrap_or(0)
+        },
+        async {
+            query_bool_field(storage, "Active", netuid, uid)
+                .await
+                .unwrap_or(false)
+        },
+        async {
+            query_u64_field(storage, "LastUpdate", netuid, uid)
+                .await
+                .unwrap_or(0)
+        },
+        async {
+            query_axon(storage, netuid, &hotkey_bytes)
+                .await
+                .unwrap_or_default()
+        },
+    );
+
+    Ok(NeuronInfo {
+        uid,
+        hotkey,
+        coldkey,
+        hotkey_bytes,
+        stake,
+        rank,
+        trust,
+        consensus,
+        incentive,
+        dividends,
+        emission,
+        is_active,
+        last_update,
+        axon_ip: axon.0,
+        axon_port: axon.1,
+        axon_protocol: axon.2,
+        validator_permit: false,
+    })
+}
+
+async fn query_hotkey(
+    storage: &Storage<PolkadotConfig, OnlineClient<PolkadotConfig>>,
+    netuid: u16,
+    uid: u16,
+) -> Result<([u8; 32], String)> {
+    let query = subxt::dynamic::storage(
+        "SubtensorModule",
+        "Keys",
+        vec![Value::from(netuid as u64), Value::from(uid as u64)],
+    );
+
+    let result = storage.fetch(&query).await?.context("hotkey not found")?;
+
+    let account_id: subxt::utils::AccountId32 = result.as_type()?;
+    let bytes = account_id.0;
+    let ss58 = sp_core::crypto::AccountId32::new(bytes).to_ss58check();
+    Ok((bytes, ss58))
+}
+
+async fn query_coldkey(
+    storage: &Storage<PolkadotConfig, OnlineClient<PolkadotConfig>>,
+    hotkey_bytes: &[u8; 32],
+) -> Result<String> {
+    let query = subxt::dynamic::storage(
+        "SubtensorModule",
+        "Owner",
+        vec![Value::from_bytes(hotkey_bytes)],
+    );
+
+    let result = storage.fetch(&query).await?.context("coldkey not found")?;
+
+    let account_id: subxt::utils::AccountId32 = result.as_type()?;
+    let ss58 = sp_core::crypto::AccountId32::new(account_id.0).to_ss58check();
+    Ok(ss58)
+}
+
+async fn query_stake(
+    storage: &Storage<PolkadotConfig, OnlineClient<PolkadotConfig>>,
+    hotkey_bytes: &[u8; 32],
+) -> Result<u64> {
+    let query = subxt::dynamic::storage(
+        "SubtensorModule",
+        "TotalHotkeyStake",
+        vec![Value::from_bytes(hotkey_bytes)],
+    );
+
+    let result = storage.fetch(&query).await?;
+
+    match result {
+        Some(val) => Ok(val.to_value()?.as_u128().unwrap_or(0) as u64),
+        None => Ok(0),
+    }
+}
+
+async fn query_u16_field(
+    storage: &Storage<PolkadotConfig, OnlineClient<PolkadotConfig>>,
+    storage_name: &str,
+    netuid: u16,
+    uid: u16,
+) -> Result<u16> {
+    let query = subxt::dynamic::storage(
+        "SubtensorModule",
+        storage_name,
+        vec![Value::from(netuid as u64), Value::from(uid as u64)],
+    );
+
+    let result = storage.fetch(&query).await?;
+
+    match result {
+        Some(val) => Ok(val.to_value()?.as_u128().unwrap_or(0) as u16),
+        None => Ok(0),
+    }
+}
+
+async fn query_u64_field(
+    storage: &Storage<PolkadotConfig, OnlineClient<PolkadotConfig>>,
+    storage_name: &str,
+    netuid: u16,
+    uid: u16,
+) -> Result<u64> {
+    let query = subxt::dynamic::storage(
+        "SubtensorModule",
+        storage_name,
+        vec![Value::from(netuid as u64), Value::from(uid as u64)],
+    );
+
+    let result = storage.fetch(&query).await?;
+
+    match result {
+        Some(val) => Ok(val.to_value()?.as_u128().unwrap_or(0) as u64),
+        None => Ok(0),
+    }
+}
+
+async fn query_bool_field(
+    storage: &Storage<PolkadotConfig, OnlineClient<PolkadotConfig>>,
+    storage_name: &str,
+    netuid: u16,
+    uid: u16,
+) -> Result<bool> {
+    let query = subxt::dynamic::storage(
+        "SubtensorModule",
+        storage_name,
+        vec![Value::from(netuid as u64), Value::from(uid as u64)],
+    );
+
+    let result = storage.fetch(&query).await?;
+
+    match result {
+        Some(val) => Ok(val.to_value()?.as_bool().unwrap_or(false)),
+        None => Ok(false),
+    }
+}
+
+async fn query_axon(
+    storage: &Storage<PolkadotConfig, OnlineClient<PolkadotConfig>>,
+    netuid: u16,
+    hotkey_bytes: &[u8; 32],
+) -> Result<(String, u16, u8)> {
+    let query = subxt::dynamic::storage(
+        "SubtensorModule",
+        "Axons",
+        vec![Value::from(netuid as u64), Value::from_bytes(hotkey_bytes)],
+    );
+
+    let result = storage.fetch(&query).await?;
+
+    match result {
+        Some(val) => {
+            let v = val.to_value()?;
+            let ip_raw = v.at("ip").and_then(|v| v.as_u128()).unwrap_or(0) as u32;
+            let port = v.at("port").and_then(|v| v.as_u128()).unwrap_or(0) as u16;
+            let protocol = v.at("protocol").and_then(|v| v.as_u128()).unwrap_or(0) as u8;
+
+            let ip = format!(
+                "{}.{}.{}.{}",
+                (ip_raw >> 24) & 0xFF,
+                (ip_raw >> 16) & 0xFF,
+                (ip_raw >> 8) & 0xFF,
+                ip_raw & 0xFF,
+            );
+
+            Ok((ip, port, protocol))
+        }
+        None => Ok((String::new(), 0, 0)),
+    }
+}
+
+async fn query_validator_permits(
+    storage: &Storage<PolkadotConfig, OnlineClient<PolkadotConfig>>,
+    netuid: u16,
+) -> Result<Vec<bool>> {
+    let query = subxt::dynamic::storage(
+        "SubtensorModule",
+        "ValidatorPermit",
+        vec![Value::from(netuid as u64)],
+    );
+
+    let result = storage.fetch(&query).await?;
+
+    match result {
+        Some(val) => val
+            .as_type::<Vec<bool>>()
+            .context("decoding ValidatorPermit"),
+        None => Ok(Vec::new()),
     }
 }
