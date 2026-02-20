@@ -13,7 +13,7 @@ use tracing::{error, info, warn};
 
 use crate::circuit_store::CircuitStore;
 use crate::config::ValidatorConfig;
-use crate::dsperse::DSperseManager;
+use crate::dsperse::{BenchmarkRunHandle, DSperseManager};
 use crate::incremental_runner::{IncrementalRunManager, SliceArtifact};
 use crate::miner_client::MinerQueryClient;
 use crate::performance::PerformanceTracker;
@@ -175,6 +175,7 @@ pub struct ValidatorLoop {
     pending_reveal: Option<PendingReveal>,
     weight_tasks: JoinSet<WeightTaskResult>,
     dsperse_benchmark_backoff_until: Instant,
+    pending_benchmark_run: Option<BenchmarkRunHandle>,
 }
 
 impl ValidatorLoop {
@@ -258,6 +259,7 @@ impl ValidatorLoop {
             pending_reveal: None,
             weight_tasks: JoinSet::new(),
             dsperse_benchmark_backoff_until: now,
+            pending_benchmark_run: None,
         })
     }
 
@@ -603,7 +605,10 @@ impl ValidatorLoop {
             return;
         }
 
-        if self.config.disable_benchmark || self.run_manager.has_benchmark_runs() {
+        if self.config.disable_benchmark
+            || self.run_manager.has_benchmark_runs()
+            || self.pending_benchmark_run.is_some()
+        {
             return;
         }
         if Instant::now() < self.dsperse_benchmark_backoff_until {
@@ -626,34 +631,14 @@ impl ValidatorLoop {
 
         info!(circuit = %circuit.id, name = %circuit.metadata.name, "starting dsperse benchmark run");
 
-        match self
-            .dsperse
-            .start_benchmark_run(&circuit.id, &schema, Some(1))
-            .await
-        {
-            Ok(result) => {
-                if let Some(err) = result.get("error") {
-                    warn!(error = %err, "dsperse benchmark run returned error");
-                    self.dsperse_benchmark_backoff_until = Instant::now() + Duration::from_secs(60);
-                    return;
-                }
-                let run_uid = result
-                    .get("run_uid")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-
-                info!(run_uid = %run_uid, circuit = %circuit.id, "dsperse benchmark run started");
-
-                self.run_manager.start_run(
-                    run_uid.clone(),
-                    circuit.id.clone(),
-                    circuit.metadata.name.clone(),
-                    RunSource::Benchmark,
-                    None,
-                );
-
-                self.enqueue_dsperse_work(&run_uid, circuit).await;
+        match self.dsperse.spawn_benchmark_run(
+            &circuit.id,
+            &circuit.metadata.name,
+            &schema,
+            Some(1),
+        ) {
+            Ok(handle) => {
+                self.pending_benchmark_run = Some(handle);
             }
             Err(e) => {
                 warn!(error = %e, "failed to start dsperse benchmark run");
@@ -1665,6 +1650,50 @@ impl ValidatorLoop {
         while let Some(result) = self.upload_tasks.try_join_next() {
             if let Err(e) = result {
                 warn!(error = %e, "upload task panicked");
+            }
+        }
+
+        if let Some(handle) = &mut self.pending_benchmark_run {
+            if handle.handle.is_finished() {
+                let taken = self.pending_benchmark_run.take().unwrap();
+                match taken.handle.await {
+                    Ok(Ok(result)) => {
+                        if let Some(err) = result.get("error") {
+                            warn!(error = %err, "dsperse benchmark run returned error");
+                            self.dsperse_benchmark_backoff_until =
+                                Instant::now() + Duration::from_secs(60);
+                        } else {
+                            let run_uid = result
+                                .get("run_uid")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            info!(run_uid = %run_uid, circuit = %taken.circuit_id, "dsperse benchmark run started");
+                            self.run_manager.start_run(
+                                run_uid.clone(),
+                                taken.circuit_id.clone(),
+                                taken.circuit_name.clone(),
+                                RunSource::Benchmark,
+                                None,
+                            );
+                            if let Some(circuit) = self.circuit_store.get_circuit(&taken.circuit_id)
+                            {
+                                let circuit = circuit.clone();
+                                self.enqueue_dsperse_work(&run_uid, &circuit).await;
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "dsperse benchmark run IPC failed");
+                        self.dsperse_benchmark_backoff_until =
+                            Instant::now() + Duration::from_secs(60);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "dsperse benchmark run task panicked");
+                        self.dsperse_benchmark_backoff_until =
+                            Instant::now() + Duration::from_secs(60);
+                    }
+                }
             }
         }
 

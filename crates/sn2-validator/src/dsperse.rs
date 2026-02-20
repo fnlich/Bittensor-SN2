@@ -6,10 +6,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
-const BENCHMARK_RUN_TIMEOUT_SECS: u64 = 300;
+const BENCHMARK_RUN_TIMEOUT_SECS: u64 = 1800;
 
 pub struct DSperseManager {
     socket_path: Option<String>,
+}
+
+pub struct BenchmarkRunHandle {
+    pub circuit_id: String,
+    pub circuit_name: String,
+    pub handle: tokio::task::JoinHandle<Result<serde_json::Value>>,
 }
 
 impl DSperseManager {
@@ -35,15 +41,26 @@ impl DSperseManager {
         self.send_ipc(&request).await
     }
 
-    pub async fn start_benchmark_run(
+    pub fn spawn_benchmark_run(
         &self,
         circuit_id: &str,
+        circuit_name: &str,
         input_schema: &HashMap<String, serde_json::Value>,
         max_tiles: Option<u32>,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<BenchmarkRunHandle> {
         let payload = build_benchmark_payload(circuit_id, input_schema, max_tiles)?;
-        self.send_and_receive(&payload, BENCHMARK_RUN_TIMEOUT_SECS)
-            .await
+        let socket_path = self
+            .socket_path
+            .clone()
+            .unwrap_or_else(|| "/tmp/dsperse.sock".to_string());
+        let handle = tokio::spawn(async move {
+            send_and_receive_standalone(&socket_path, &payload, BENCHMARK_RUN_TIMEOUT_SECS).await
+        });
+        Ok(BenchmarkRunHandle {
+            circuit_id: circuit_id.to_string(),
+            circuit_name: circuit_name.to_string(),
+            handle,
+        })
     }
 
     pub async fn get_run_status(&self, run_uid: &str) -> Result<serde_json::Value> {
@@ -212,6 +229,41 @@ impl DSperseManager {
         let response: serde_json::Value = serde_json::from_slice(&resp_buf)?;
         Ok(response)
     }
+}
+
+async fn send_and_receive_standalone(
+    socket_path: &str,
+    payload: &[u8],
+    timeout_secs: u64,
+) -> Result<serde_json::Value> {
+    tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+        let mut stream = UnixStream::connect(socket_path)
+            .await
+            .with_context(|| format!("connecting to dsperse at {socket_path}"))?;
+
+        let len = u32::try_from(payload.len())
+            .context("IPC payload exceeds u32::MAX")?
+            .to_be_bytes();
+        stream.write_all(&len).await?;
+        stream.write_all(payload).await?;
+        stream.flush().await?;
+
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let resp_len = u32::from_be_bytes(len_buf) as usize;
+        anyhow::ensure!(
+            resp_len <= 64 * 1024 * 1024,
+            "IPC response length {resp_len} exceeds 64MB cap"
+        );
+
+        let mut resp_buf = vec![0u8; resp_len];
+        stream.read_exact(&mut resp_buf).await?;
+
+        let response: serde_json::Value = serde_json::from_slice(&resp_buf)?;
+        Ok(response)
+    })
+    .await
+    .with_context(|| format!("dsperse IPC timed out after {timeout_secs}s"))?
 }
 
 fn build_benchmark_payload(
