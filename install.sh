@@ -3,7 +3,13 @@ set -euo pipefail
 
 REPO="inference-labs-inc/subnet-2"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
+NETWORK="$(echo "${NETWORK:-mainnet}" | tr '[:upper:]' '[:lower:]')"
 BINARY="${1:-all}"
+
+case "$NETWORK" in
+  mainnet|testnet) ;;
+  *) echo "Unknown NETWORK: $NETWORK (expected 'mainnet' or 'testnet')" >&2; exit 1 ;;
+esac
 TMP_DIR=""
 
 cleanup() { [ -n "$TMP_DIR" ] && rm -rf "$TMP_DIR"; }
@@ -30,7 +36,13 @@ detect_platform() {
 }
 
 get_latest_tag() {
-  curl -fsSL --connect-timeout 10 --max-time 30 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/' || true
+  local api_url
+  if [ "$NETWORK" = "testnet" ]; then
+    api_url="https://api.github.com/repos/${REPO}/releases/tags/testnet-latest"
+  else
+    api_url="https://api.github.com/repos/${REPO}/releases/latest"
+  fi
+  curl -fsSL --connect-timeout 10 --max-time 30 "$api_url" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/' || true
 }
 
 download_sums() {

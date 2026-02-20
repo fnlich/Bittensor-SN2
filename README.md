@@ -64,6 +64,14 @@ curl -fsSL https://raw.githubusercontent.com/inference-labs-inc/subnet-2/main/in
 curl -fsSL https://raw.githubusercontent.com/inference-labs-inc/subnet-2/main/install.sh | bash -s -- sn2-validator
 ```
 
+For testnet builds (from the `testnet` branch):
+
+```console
+curl -fsSL https://raw.githubusercontent.com/inference-labs-inc/subnet-2/testnet/install.sh | NETWORK=testnet bash
+curl -fsSL https://raw.githubusercontent.com/inference-labs-inc/subnet-2/testnet/install.sh | NETWORK=testnet bash -s -- sn2-miner
+curl -fsSL https://raw.githubusercontent.com/inference-labs-inc/subnet-2/testnet/install.sh | NETWORK=testnet bash -s -- sn2-validator
+```
+
 Or download manually from [GitHub Releases](https://github.com/inference-labs-inc/subnet-2/releases).
 
 ### Build from source
