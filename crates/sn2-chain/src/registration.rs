@@ -2,7 +2,6 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use sp_core::crypto::Ss58Codec;
 use subxt::dynamic::Value;
 use subxt::{OnlineClient, PolkadotConfig};
 use tracing::info;
@@ -40,21 +39,15 @@ impl Registration {
             }
         };
 
-        let hotkey_bytes = wallet.hotkey_public_bytes()?;
-        let coldkey_bytes = sp_core::crypto::AccountId32::from_ss58check(wallet.coldkey_ss58())
-            .map_err(|e| anyhow::anyhow!("invalid coldkey SS58: {:?}", e))?;
-
         let tx = subxt::dynamic::tx(
             "SubtensorModule",
             "serve_axon",
             vec![
+                Value::from(self.netuid as u64),
                 Value::from(0u64),
                 Value::from(ip_int),
                 Value::from(port as u64),
                 Value::from(ip_type),
-                Value::from(self.netuid as u64),
-                Value::from_bytes(hotkey_bytes),
-                Value::from_bytes(AsRef::<[u8]>::as_ref(&coldkey_bytes)),
                 Value::from(protocol as u64),
                 Value::from(0u64),
                 Value::from(0u64),
