@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use btlightning::QuicAxonInfo;
-use sn2_chain::WeightsSetter;
+use sn2_chain::{PendingReveal, WeightsSetter};
 use sn2_types::*;
 use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinSet;
@@ -165,6 +165,7 @@ pub struct ValidatorLoop {
     proof_uploader: Arc<ProofUploader>,
     benchmark_in_flight: usize,
     upload_tasks: JoinSet<()>,
+    pending_reveal: Option<PendingReveal>,
 }
 
 impl ValidatorLoop {
@@ -245,6 +246,7 @@ impl ValidatorLoop {
             proof_uploader,
             benchmark_in_flight: 0,
             upload_tasks: JoinSet::new(),
+            pending_reveal: None,
         })
     }
 
@@ -1498,13 +1500,21 @@ impl ValidatorLoop {
             self.last_metagraph_sync = now;
         }
 
+        if self.pending_reveal.is_some() {
+            if let Err(e) = self.try_reveal_weights().await {
+                warn!(error = ?e, "weight reveal failed, will retry next cycle");
+            }
+        }
+
         if now.duration_since(self.last_weight_update)
             > Duration::from_secs(WEIGHT_UPDATE_POLL_SECS)
         {
-            match self.update_weights().await {
-                Ok(()) => {}
-                Err(e) => {
-                    warn!(error = ?e, "weight update failed, will retry next cycle");
+            if self.pending_reveal.is_none() {
+                match self.update_weights().await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        warn!(error = ?e, "weight update failed, will retry next cycle");
+                    }
                 }
             }
             self.last_weight_update = now;
@@ -1636,6 +1646,64 @@ impl ValidatorLoop {
         Ok(())
     }
 
+    async fn try_reveal_weights(&mut self) -> Result<()> {
+        let reveal = match &self.pending_reveal {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+
+        let (tempo, reveal_period, current_block) = tokio::join!(
+            self.weights_setter.query_tempo(&self.config.chain_client),
+            self.weights_setter
+                .query_reveal_period(&self.config.chain_client),
+            self.weights_setter.current_block(&self.config.chain_client),
+        );
+        let tempo = tempo?;
+        let reveal_period = reveal_period?;
+        let current_block = current_block?;
+
+        let (first_reveal, last_reveal) = WeightsSetter::get_reveal_blocks(
+            self.config.netuid,
+            tempo,
+            reveal_period,
+            reveal.commit_block,
+        );
+
+        if current_block < first_reveal {
+            return Ok(());
+        }
+
+        if current_block > last_reveal {
+            warn!(
+                commit_block = reveal.commit_block,
+                first_reveal = first_reveal,
+                last_reveal = last_reveal,
+                current_block = current_block,
+                "reveal window expired, discarding pending commit"
+            );
+            self.pending_reveal = None;
+            return Ok(());
+        }
+
+        let reveal = self.pending_reveal.take().unwrap();
+        self.weights_setter
+            .reveal_weights(
+                &self.config.chain_client,
+                &self.config.wallet,
+                &reveal.uids,
+                &reveal.values,
+                &reveal.salt,
+                reveal.version_key,
+            )
+            .await
+            .context("revealing weights on chain")?;
+
+        self.performance_tracker.save();
+        metrics::record_weight_update();
+        info!(uids = reveal.uids.len(), "weights revealed on chain");
+        Ok(())
+    }
+
     async fn update_weights(&mut self) -> Result<()> {
         let blocks_since = self
             .weights_setter
@@ -1690,20 +1758,63 @@ impl ValidatorLoop {
             return Ok(());
         }
 
-        self.weights_setter
-            .set_weights(
-                &self.config.chain_client,
-                &self.config.wallet,
+        let cr_enabled = self
+            .weights_setter
+            .commit_reveal_enabled(&self.config.chain_client)
+            .await
+            .unwrap_or(false);
+
+        if cr_enabled {
+            let salt: Vec<u16> = (0..weight_uids.len())
+                .map(|_| rand::Rng::gen(&mut rand::thread_rng()))
+                .collect();
+            let version_key = WEIGHTS_VERSION as u64;
+
+            let hotkey_account = self.config.wallet.hotkey_account_id()?;
+            let hash = WeightsSetter::compute_commit_hash(
+                &hotkey_account,
+                self.config.netuid,
                 &weight_uids,
                 &weights,
-                WEIGHTS_VERSION,
-            )
-            .await
-            .context("setting weights on chain")?;
+                &salt,
+                version_key,
+            );
 
-        self.performance_tracker.save();
-        metrics::record_weight_update();
-        info!(uids = weight_uids.len(), "weights updated on chain");
+            let commit_block = self
+                .weights_setter
+                .commit_weights(&self.config.chain_client, &self.config.wallet, &hash)
+                .await
+                .context("committing weights on chain")?;
+
+            self.pending_reveal = Some(PendingReveal {
+                uids: weight_uids,
+                values: weights,
+                salt,
+                version_key,
+                commit_block,
+            });
+
+            info!(
+                commit_block = commit_block,
+                "weight commit submitted, awaiting reveal window"
+            );
+        } else {
+            self.weights_setter
+                .set_weights(
+                    &self.config.chain_client,
+                    &self.config.wallet,
+                    &weight_uids,
+                    &weights,
+                    WEIGHTS_VERSION,
+                )
+                .await
+                .context("setting weights on chain")?;
+
+            self.performance_tracker.save();
+            metrics::record_weight_update();
+            info!(uids = weight_uids.len(), "weights set on chain");
+        }
+
         Ok(())
     }
 

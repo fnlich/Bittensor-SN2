@@ -1,12 +1,22 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use parity_scale_codec::Encode;
+use sp_core::hashing::blake2_256;
 use subxt::dynamic::Value;
 use subxt::tx::Signer;
 use subxt::{OnlineClient, PolkadotConfig};
 use tracing::info;
 
 use crate::wallet::Wallet;
+
+pub struct PendingReveal {
+    pub uids: Vec<u16>,
+    pub values: Vec<u16>,
+    pub salt: Vec<u16>,
+    pub version_key: u64,
+    pub commit_block: u64,
+}
 
 pub struct WeightsSetter {
     netuid: u16,
@@ -15,6 +25,79 @@ pub struct WeightsSetter {
 impl WeightsSetter {
     pub fn new(netuid: u16) -> Self {
         Self { netuid }
+    }
+
+    pub fn compute_commit_hash(
+        hotkey_account: &subxt::utils::AccountId32,
+        netuid: u16,
+        uids: &[u16],
+        values: &[u16],
+        salt: &[u16],
+        version_key: u64,
+    ) -> [u8; 32] {
+        let payload = (hotkey_account.0, netuid, uids, values, salt, version_key).encode();
+        blake2_256(&payload)
+    }
+
+    pub async fn commit_reveal_enabled(
+        &self,
+        client: &OnlineClient<PolkadotConfig>,
+    ) -> Result<bool> {
+        let query = subxt::dynamic::storage(
+            "SubtensorModule",
+            "CommitRevealWeightsEnabled",
+            vec![Value::from(self.netuid as u64)],
+        );
+        let storage = client.storage().at_latest().await?;
+        match storage.fetch(&query).await? {
+            Some(val) => Ok(val.to_value()?.as_bool().unwrap_or(false)),
+            None => Ok(false),
+        }
+    }
+
+    pub async fn query_tempo(&self, client: &OnlineClient<PolkadotConfig>) -> Result<u64> {
+        let query = subxt::dynamic::storage(
+            "SubtensorModule",
+            "Tempo",
+            vec![Value::from(self.netuid as u64)],
+        );
+        let storage = client.storage().at_latest().await?;
+        match storage.fetch(&query).await? {
+            Some(val) => Ok(val.to_value()?.as_u128().unwrap_or(360) as u64),
+            None => Ok(360),
+        }
+    }
+
+    pub async fn query_reveal_period(&self, client: &OnlineClient<PolkadotConfig>) -> Result<u64> {
+        let query = subxt::dynamic::storage(
+            "SubtensorModule",
+            "RevealPeriodEpochs",
+            vec![Value::from(self.netuid as u64)],
+        );
+        let storage = client.storage().at_latest().await?;
+        match storage.fetch(&query).await? {
+            Some(val) => Ok(val.to_value()?.as_u128().unwrap_or(1) as u64),
+            None => Ok(1),
+        }
+    }
+
+    pub async fn current_block(&self, client: &OnlineClient<PolkadotConfig>) -> Result<u64> {
+        Ok(client.blocks().at_latest().await?.number() as u64)
+    }
+
+    pub fn get_reveal_blocks(
+        netuid: u16,
+        tempo: u64,
+        reveal_period: u64,
+        commit_block: u64,
+    ) -> (u64, u64) {
+        let tempo_plus_one = tempo + 1;
+        let netuid_offset = netuid as u64 + 1;
+        let commit_epoch = (commit_block + netuid_offset) / tempo_plus_one;
+        let reveal_epoch = commit_epoch + reveal_period;
+        let first_reveal_block = reveal_epoch * tempo_plus_one - netuid_offset;
+        let last_reveal_block = first_reveal_block + tempo;
+        (first_reveal_block, last_reveal_block)
     }
 
     pub async fn set_weights(
@@ -70,8 +153,8 @@ impl WeightsSetter {
         &self,
         client: &OnlineClient<PolkadotConfig>,
         wallet: &Arc<Wallet>,
-        commit_hash: &[u8],
-    ) -> Result<()> {
+        commit_hash: &[u8; 32],
+    ) -> Result<u64> {
         let tx = subxt::dynamic::tx(
             "SubtensorModule",
             "commit_weights",
@@ -92,8 +175,9 @@ impl WeightsSetter {
             .await
             .context("commit_weights finalization")?;
 
-        info!(block = %result.extrinsic_hash(), "weights committed");
-        Ok(())
+        let block = client.blocks().at_latest().await?.number() as u64;
+        info!(block = block, hash = %result.extrinsic_hash(), "weights committed");
+        Ok(block)
     }
 
     pub async fn reveal_weights(
@@ -103,14 +187,13 @@ impl WeightsSetter {
         uids: &[u16],
         values: &[u16],
         salt: &[u16],
-        version_key: u32,
+        version_key: u64,
     ) -> Result<()> {
         anyhow::ensure!(
-            uids.len() == values.len() && values.len() == salt.len(),
-            "reveal_weights: length mismatch uids={} values={} salt={}",
+            uids.len() == values.len(),
+            "reveal_weights: length mismatch uids={} values={}",
             uids.len(),
             values.len(),
-            salt.len()
         );
 
         let uid_vals: Vec<Value> = uids.iter().map(|&u| Value::from(u as u64)).collect();
@@ -125,7 +208,7 @@ impl WeightsSetter {
                 Value::unnamed_composite(uid_vals),
                 Value::unnamed_composite(weight_vals),
                 Value::unnamed_composite(salt_vals),
-                Value::from(version_key as u64),
+                Value::from(version_key),
             ],
         );
 

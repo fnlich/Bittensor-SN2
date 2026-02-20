@@ -78,7 +78,7 @@ impl Wallet {
         Ok(arr)
     }
 
-    pub(crate) fn hotkey_account_id(&self) -> Result<subxt::utils::AccountId32> {
+    pub fn hotkey_account_id(&self) -> Result<subxt::utils::AccountId32> {
         let bytes = self.hotkey_public_bytes()?;
         Ok(subxt::utils::AccountId32::from(bytes))
     }
