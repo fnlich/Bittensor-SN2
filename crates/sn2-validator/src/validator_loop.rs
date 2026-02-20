@@ -1608,12 +1608,18 @@ impl ValidatorLoop {
         }
 
         if now.duration_since(self.last_health_log) > Duration::from_secs(15) {
+            let queryable_count = self.get_queryable_neurons().len();
+            let benchmark_count = self.circuit_store.get_benchmark_circuits().len();
             info!(
                 active_tasks = self.tasks.len(),
                 rwr_queue = self.rwr_queue.len(),
                 api_dslice_queue = self.api_dslice_queue.len(),
                 stacked_dslice_queue = self.stacked_dslice_queue.len(),
                 active_runs = self.run_manager.active_count(),
+                queryable_neurons = queryable_count,
+                benchmark_circuits = benchmark_count,
+                max_concurrency = self.config.max_concurrency,
+                benchmark_in_flight = self.benchmark_in_flight,
                 "health"
             );
             self.last_health_log = now;
