@@ -39,4 +39,6 @@ pub struct MinerResponse {
     pub is_incremental: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub witness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inputs_path: Option<String>,
 }

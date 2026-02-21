@@ -722,6 +722,7 @@ impl ValidatorLoop {
                 let tile_idx: Option<u32>;
                 let task_circuit: Option<Circuit>;
                 let task_inputs: Option<serde_json::Value>;
+                let task_inputs_path: Option<String>;
                 let task_proof_system: Option<ProofSystem>;
                 let retry_payload: RetryPayload;
 
@@ -751,6 +752,7 @@ impl ValidatorLoop {
                     guard_hash = Some(String::new());
                     task_circuit = Some(pow_circ.clone());
                     task_inputs = Some(inputs.clone());
+                    task_inputs_path = None;
                     task_proof_system = Some(pow_circ.proof_system);
                     retry_payload = RetryPayload::None;
                 } else if let Some(rwr) = self.rwr_queue.pop_front() {
@@ -791,6 +793,7 @@ impl ValidatorLoop {
                     synapse_name = QueryZkProof::NAME;
                     task_circuit = Some(circuit.clone());
                     task_inputs = Some(rwr.inputs.clone());
+                    task_inputs_path = None;
                     task_proof_system = Some(circuit.proof_system);
                     body = serde_json::json!({
                         "model_id": circuit.id,
@@ -802,19 +805,14 @@ impl ValidatorLoop {
                         break;
                     }
                 } else if api_eligible.contains(&uid) && !self.api_dslice_queue.is_empty() {
-                    let mut dslice = self.api_dslice_queue.pop_front().unwrap();
-                    if dslice.inputs.is_null() {
-                        if let Some(ref path) = dslice.inputs_path {
-                            if let Some(val) = load_json_from_path(path) {
-                                dslice.inputs = val;
-                            }
-                        }
-                    }
-                    if dslice.outputs.is_none() {
-                        if let Some(ref path) = dslice.outputs_path {
-                            dslice.outputs = load_json_from_path(path);
-                        }
-                    }
+                    let dslice = self.api_dslice_queue.pop_front().unwrap();
+                    let loaded_inputs = dslice
+                        .inputs_path
+                        .as_deref()
+                        .and_then(load_json_from_path)
+                        .unwrap_or(serde_json::Value::Null);
+                    let loaded_outputs =
+                        dslice.outputs_path.as_deref().and_then(load_json_from_path);
                     retry_payload = RetryPayload::DSlice(Box::new(dslice.clone()));
                     request_type = RequestType::DSlice;
                     external_request_hash = None;
@@ -825,14 +823,15 @@ impl ValidatorLoop {
                     task_id = dslice.task_id.clone();
                     tile_idx = dslice.tile_idx;
                     task_circuit = Some(dslice.circuit.clone());
-                    task_inputs = Some(dslice.inputs.clone());
+                    task_inputs = None;
+                    task_inputs_path = dslice.inputs_path.clone();
                     task_proof_system = Some(dslice.proof_system);
                     synapse_name = DSliceProofGenerationDataModel::NAME;
                     let dslice_model = self.pipeline.prepare_dslice_request(
                         uid,
                         &dslice.circuit,
-                        dslice.inputs.clone(),
-                        dslice.outputs.clone(),
+                        loaded_inputs,
+                        loaded_outputs,
                         &dslice.slice_num,
                         &dslice.run_uid,
                         dslice.proof_system,
@@ -843,19 +842,14 @@ impl ValidatorLoop {
                         self.api_dslice_queue.push_back(dslice);
                         break;
                     }
-                } else if let Some(mut dslice) = self.stacked_dslice_queue.pop_front() {
-                    if dslice.inputs.is_null() {
-                        if let Some(ref path) = dslice.inputs_path {
-                            if let Some(val) = load_json_from_path(path) {
-                                dslice.inputs = val;
-                            }
-                        }
-                    }
-                    if dslice.outputs.is_none() {
-                        if let Some(ref path) = dslice.outputs_path {
-                            dslice.outputs = load_json_from_path(path);
-                        }
-                    }
+                } else if let Some(dslice) = self.stacked_dslice_queue.pop_front() {
+                    let loaded_inputs = dslice
+                        .inputs_path
+                        .as_deref()
+                        .and_then(load_json_from_path)
+                        .unwrap_or(serde_json::Value::Null);
+                    let loaded_outputs =
+                        dslice.outputs_path.as_deref().and_then(load_json_from_path);
                     retry_payload = RetryPayload::DSlice(Box::new(dslice.clone()));
                     request_type = RequestType::DSlice;
                     external_request_hash = None;
@@ -866,14 +860,15 @@ impl ValidatorLoop {
                     task_id = dslice.task_id.clone();
                     tile_idx = dslice.tile_idx;
                     task_circuit = Some(dslice.circuit.clone());
-                    task_inputs = Some(dslice.inputs.clone());
+                    task_inputs = None;
+                    task_inputs_path = dslice.inputs_path.clone();
                     task_proof_system = Some(dslice.proof_system);
                     synapse_name = DSliceProofGenerationDataModel::NAME;
                     let dslice_model = self.pipeline.prepare_dslice_request(
                         uid,
                         &dslice.circuit,
-                        dslice.inputs.clone(),
-                        dslice.outputs.clone(),
+                        loaded_inputs,
+                        loaded_outputs,
                         &dslice.slice_num,
                         &dslice.run_uid,
                         dslice.proof_system,
@@ -921,6 +916,7 @@ impl ValidatorLoop {
                     match self.pipeline.prepare_benchmark_request(circuit, inputs) {
                         Some(req) => {
                             task_inputs = Some(req.inputs.clone());
+                            task_inputs_path = None;
                             body = serde_json::json!({
                                 "model_id": req.circuit.id,
                                 "query_input": req.inputs,
@@ -950,6 +946,7 @@ impl ValidatorLoop {
                 let task_task_id = task_id.clone();
                 let task_circuit_clone = task_circuit;
                 let task_inputs_clone = task_inputs;
+                let task_inputs_path_clone = task_inputs_path;
                 let task_proof_system_clone = task_proof_system;
                 let task_retry_payload = retry_payload;
                 let task_guard_hash = guard_hash.clone();
@@ -1020,6 +1017,7 @@ impl ValidatorLoop {
                                 computed_outputs: None,
                                 is_incremental: request_type == RequestType::DSlice,
                                 witness: None,
+                                inputs_path: task_inputs_path_clone,
                             };
                             response.proof_size = response
                                 .proof_content

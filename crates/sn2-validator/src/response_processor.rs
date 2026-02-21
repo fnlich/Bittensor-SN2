@@ -150,11 +150,19 @@ impl ResponseProcessor {
         };
 
         let slice_num = response.dsperse_slice_num.unwrap_or(0).to_string();
-        let inputs = response
-            .inputs
-            .as_ref()
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
+        let inputs = match &response.inputs {
+            Some(v) if !v.is_null() => v.clone(),
+            _ => match &response.inputs_path {
+                Some(path) => match std::fs::read(path) {
+                    Ok(data) => serde_json::from_slice(&data).unwrap_or(serde_json::Value::Null),
+                    Err(e) => {
+                        warn!(uid = response.uid, path = %path, error = %e, "failed to read inputs file for verification");
+                        serde_json::Value::Null
+                    }
+                },
+                None => serde_json::Value::Null,
+            },
+        };
         let proof_system_str = response.proof_system.as_ref().map(|ps| ps.to_string());
 
         match dsperse
