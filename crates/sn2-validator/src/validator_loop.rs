@@ -432,9 +432,13 @@ impl ValidatorLoop {
 
     async fn enqueue_next_dslice(&mut self, run_uid: &str, circuit: &Circuit) {
         let slice_info = match self.run_manager.next_slice(run_uid) {
-            Some(info) => info,
-            None => {
+            Ok(Some(info)) => info,
+            Ok(None) => {
                 warn!(run_uid = %run_uid, "no next slice available");
+                return;
+            }
+            Err(e) => {
+                warn!(run_uid = %run_uid, error = %e, "next_slice failed");
                 return;
             }
         };

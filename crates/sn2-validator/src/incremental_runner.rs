@@ -86,17 +86,26 @@ impl IncrementalRunManager {
         self.runs.get(run_uid).map(|r| r.circuit_id.as_str())
     }
 
-    pub fn next_slice(&self, run_uid: &str) -> Option<NextSliceInfo> {
-        let run = self.runs.get(run_uid)?;
-        let inc = run.incremental.as_ref()?;
-        let work: SliceWork = inc.next_slice()?;
+    pub fn next_slice(&self, run_uid: &str) -> anyhow::Result<Option<NextSliceInfo>> {
+        let run = match self.runs.get(run_uid) {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let inc = match run.incremental.as_ref() {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let work: SliceWork = match inc.next_slice()? {
+            Some(w) => w,
+            None => return Ok(None),
+        };
         let inputs_json = serde_json::json!({
             "input_data": arrayd_to_json(&work.input)
         });
-        Some(NextSliceInfo {
+        Ok(Some(NextSliceInfo {
             slice_id: work.slice_id,
             inputs_json,
-        })
+        }))
     }
 
     pub fn apply_result(
