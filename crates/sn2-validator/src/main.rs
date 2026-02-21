@@ -1,7 +1,6 @@
 mod circuit_store;
 mod cli;
 mod config;
-mod dsperse;
 mod incremental_runner;
 mod metrics_server;
 mod miner_client;

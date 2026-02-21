@@ -7,13 +7,12 @@ use anyhow::{Context, Result};
 use btlightning::QuicAxonInfo;
 use sn2_chain::{PendingReveal, WeightsSetter};
 use sn2_types::*;
-use tokio::sync::{Notify, RwLock, Semaphore};
+use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
 use crate::circuit_store::CircuitStore;
 use crate::config::ValidatorConfig;
-use crate::dsperse::{BenchmarkRunHandle, DSperseManager};
 use crate::incremental_runner::{IncrementalRunManager, SliceArtifact};
 use crate::miner_client::MinerQueryClient;
 use crate::performance::PerformanceTracker;
@@ -147,7 +146,6 @@ pub struct ValidatorLoop {
     relay: RelayManager,
     pipeline: RequestPipeline,
     response_processor: ResponseProcessor,
-    dsperse: DSperseManager,
     circuit_store: CircuitStore,
     tasks: JoinSet<TaskResult>,
     miner_active_count: HashMap<u16, usize>,
@@ -175,8 +173,6 @@ pub struct ValidatorLoop {
     pending_reveal: Option<PendingReveal>,
     weight_tasks: JoinSet<WeightTaskResult>,
     dsperse_benchmark_backoff_until: Instant,
-    pending_benchmark_run: Option<BenchmarkRunHandle>,
-    file_load_semaphore: Arc<Semaphore>,
 }
 
 impl ValidatorLoop {
@@ -213,7 +209,6 @@ impl ValidatorLoop {
 
         let pipeline = RequestPipeline::new();
         let response_processor = ResponseProcessor::new();
-        let dsperse = DSperseManager::new(config.dsperse_socket.clone());
         let circuit_store = CircuitStore::new();
         let run_manager = IncrementalRunManager::new();
         let proof_uploader = Arc::new(ProofUploader::new(
@@ -232,7 +227,6 @@ impl ValidatorLoop {
             relay,
             pipeline,
             response_processor,
-            dsperse,
             circuit_store,
             tasks: JoinSet::new(),
             miner_active_count: HashMap::new(),
@@ -260,8 +254,6 @@ impl ValidatorLoop {
             pending_reveal: None,
             weight_tasks: JoinSet::new(),
             dsperse_benchmark_backoff_until: now,
-            pending_benchmark_run: None,
-            file_load_semaphore: Arc::new(Semaphore::new(3)),
         })
     }
 
@@ -385,242 +377,98 @@ impl ValidatorLoop {
             return;
         }
 
-        let run_result = self
-            .dsperse
-            .start_incremental_run(&circuit.id, &submission.inputs, "api", Some(1))
-            .await;
-
-        match run_result {
-            Ok(result) => {
-                let run_uid = result
-                    .get("run_uid")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-
-                info!(run_uid = %run_uid, circuit = %circuit.id, "started incremental run");
-
-                self.run_manager.start_run(
-                    run_uid.clone(),
-                    circuit.id.clone(),
-                    circuit.metadata.name.clone(),
-                    RunSource::Api,
-                    submission.request_id.clone(),
-                );
-
-                self.relay.register_pending(&run_uid).await;
-
-                if let Some(req_id) = &submission.request_id {
-                    self.relay.send_response(req_id, result.clone()).await;
-                }
-
-                self.enqueue_dsperse_work(&run_uid, &circuit).await;
-            }
+        let slices_dir = circuit.paths.base_path.join("slices");
+        let input_tensor = match dsperse::utils::io::json_to_arrayd(&submission.inputs) {
+            Ok(t) => t,
             Err(e) => {
-                warn!(error = %e, "failed to start incremental run");
+                warn!(error = %e, "failed to convert input to tensor");
                 if let Some(req_id) = &submission.request_id {
                     self.relay
                         .send_response(req_id, serde_json::json!({"error": e.to_string()}))
                         .await;
                 }
-            }
-        }
-    }
-
-    async fn enqueue_dsperse_work(&mut self, run_uid: &str, circuit: &Circuit) {
-        let work = match self.dsperse.get_next_work(run_uid).await {
-            Ok(w) => w,
-            Err(e) => {
-                warn!(run_uid = %run_uid, error = %e, "failed to get next dsperse work");
                 return;
             }
         };
 
-        let items = work
-            .get("items")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
+        let incremental = match dsperse::pipeline::IncrementalRun::new(&slices_dir, input_tensor) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, circuit = %circuit.id, "failed to create IncrementalRun");
+                if let Some(req_id) = &submission.request_id {
+                    self.relay
+                        .send_response(req_id, serde_json::json!({"error": e.to_string()}))
+                        .await;
+                }
+                return;
+            }
+        };
 
-        for item in items {
-            let slice_num = item
-                .get("slice_num")
-                .and_then(|v| v.as_str())
-                .unwrap_or("0")
-                .to_string();
-            let task_id = item
-                .get("task_id")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let is_tile = item
-                .get("is_tile")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let tile_idx = item
-                .get("tile_idx")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32);
-            let proof_system_str = item
-                .get("proof_system")
-                .and_then(|v| v.as_str())
-                .unwrap_or("JSTPROVE");
-            let proof_system = match proof_system_str {
-                "ZKML" => ProofSystem::ZKML,
-                "CIRCOM" => ProofSystem::CIRCOM,
-                "JOLT" => ProofSystem::JOLT,
-                "EZKL" => ProofSystem::EZKL,
-                _ => ProofSystem::JSTPROVE,
-            };
-            let inputs_path = item
-                .get("inputs_path")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let outputs_path = item
-                .get("outputs_path")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let run_source_str = item
-                .get("run_source")
-                .and_then(|v| v.as_str())
-                .unwrap_or("api");
-            let run_source = match run_source_str {
-                "benchmark" => RunSource::Benchmark,
-                _ => RunSource::Api,
-            };
+        let run_uid = uuid::Uuid::new_v4().to_string();
+        info!(run_uid = %run_uid, circuit = %circuit.id, "started incremental run");
 
-            let request = DSliceRequest {
-                circuit: circuit.clone(),
-                inputs: serde_json::Value::Null,
-                request_type: RequestType::DSlice,
-                proof_system,
-                slice_num,
-                run_uid: run_uid.to_string(),
-                outputs: None,
-                is_tile,
-                tile_idx,
-                task_id,
-                run_source,
-                retry_count: 0,
-                inputs_path,
-                outputs_path,
-            };
-            match request.run_source {
-                RunSource::Api => self.api_dslice_queue.push_back(request),
-                RunSource::Benchmark => self.stacked_dslice_queue.push_back(request),
-            };
+        self.run_manager.start_run(
+            run_uid.clone(),
+            circuit.id.clone(),
+            circuit.metadata.name.clone(),
+            RunSource::Api,
+            submission.request_id.clone(),
+            Some(incremental),
+        );
+
+        self.relay.register_pending(&run_uid).await;
+
+        if let Some(req_id) = &submission.request_id {
+            self.relay
+                .send_response(
+                    req_id,
+                    serde_json::json!({"run_uid": run_uid, "status": "started"}),
+                )
+                .await;
         }
+
+        self.enqueue_next_dslice(&run_uid, &circuit).await;
+    }
+
+    async fn enqueue_next_dslice(&mut self, run_uid: &str, circuit: &Circuit) {
+        let slice_info = match self.run_manager.next_slice(run_uid) {
+            Some(info) => info,
+            None => {
+                warn!(run_uid = %run_uid, "no next slice available");
+                return;
+            }
+        };
+
+        let run_source = self
+            .run_manager
+            .has_run(run_uid)
+            .then(|| RunSource::Api)
+            .unwrap_or(RunSource::Benchmark);
+
+        let request = DSliceRequest {
+            circuit: circuit.clone(),
+            inputs: slice_info.inputs_json,
+            request_type: RequestType::DSlice,
+            proof_system: circuit.proof_system,
+            slice_num: slice_info.slice_id.clone(),
+            run_uid: run_uid.to_string(),
+            outputs: None,
+            is_tile: false,
+            tile_idx: None,
+            task_id: None,
+            run_source,
+            retry_count: 0,
+            inputs_path: None,
+            outputs_path: None,
+        };
+        match request.run_source {
+            RunSource::Api => self.api_dslice_queue.push_back(request),
+            RunSource::Benchmark => self.stacked_dslice_queue.push_back(request),
+        };
     }
 
     async fn replenish_dslice_queues(&mut self) {
-        let response = match self.dsperse.generate_requests().await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(error = %e, "dsperse generate_requests failed");
-                return;
-            }
-        };
-
-        let items = response
-            .get("items")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let item_count = items.len();
-
-        for item in items {
-            let circuit_id = match item.get("circuit_id").and_then(|v| v.as_str()) {
-                Some(id) => id.to_string(),
-                None => continue,
-            };
-            let circuit = match self.circuit_store.ensure_circuit(&circuit_id).await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(circuit = %circuit_id, error = %e, "unknown circuit in generated request");
-                    continue;
-                }
-            };
-            let run_uid = item
-                .get("run_uid")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let slice_num = item
-                .get("slice_num")
-                .and_then(|v| v.as_str())
-                .unwrap_or("0")
-                .to_string();
-            let task_id = item
-                .get("task_id")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let is_tile = item
-                .get("is_tile")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let tile_idx = item
-                .get("tile_idx")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32);
-            let proof_system_str = item
-                .get("proof_system")
-                .and_then(|v| v.as_str())
-                .unwrap_or("JSTPROVE");
-            let proof_system = match proof_system_str {
-                "ZKML" => ProofSystem::ZKML,
-                "CIRCOM" => ProofSystem::CIRCOM,
-                "JOLT" => ProofSystem::JOLT,
-                "EZKL" => ProofSystem::EZKL,
-                _ => ProofSystem::JSTPROVE,
-            };
-            let inputs_path = item
-                .get("inputs_path")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let outputs_path = item
-                .get("outputs_path")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let run_source_str = item
-                .get("run_source")
-                .and_then(|v| v.as_str())
-                .unwrap_or("benchmark");
-            let run_source = match run_source_str {
-                "api" => RunSource::Api,
-                _ => RunSource::Benchmark,
-            };
-
-            let request = DSliceRequest {
-                circuit,
-                inputs: serde_json::Value::Null,
-                request_type: RequestType::DSlice,
-                proof_system,
-                slice_num,
-                run_uid,
-                outputs: None,
-                is_tile,
-                tile_idx,
-                task_id,
-                run_source,
-                retry_count: 0,
-                inputs_path,
-                outputs_path,
-            };
-            match request.run_source {
-                RunSource::Api => self.api_dslice_queue.push_back(request),
-                RunSource::Benchmark => self.stacked_dslice_queue.push_back(request),
-            };
-        }
-
-        if item_count > 0 {
-            info!(count = item_count, "replenished dslice queues from dsperse");
-            self.dispatch_notify.notify_one();
-            return;
-        }
-
-        if self.config.disable_benchmark
-            || self.run_manager.has_benchmark_runs()
-            || self.pending_benchmark_run.is_some()
-        {
+        if self.config.disable_benchmark || self.run_manager.has_benchmark_runs() {
             return;
         }
         if Instant::now() < self.dsperse_benchmark_backoff_until {
@@ -641,22 +489,49 @@ impl ValidatorLoop {
             }
         };
 
-        info!(circuit = %circuit.id, name = %circuit.metadata.name, "starting dsperse benchmark run");
+        let total_elements: usize = schema
+            .get("shape")
+            .and_then(|v| v.as_array())
+            .map(|dims| {
+                dims.iter()
+                    .filter_map(|d| d.as_u64())
+                    .map(|d| d as usize)
+                    .product()
+            })
+            .unwrap_or(0);
 
-        match self.dsperse.spawn_benchmark_run(
-            &circuit.id,
-            &circuit.metadata.name,
-            &schema,
-            Some(1),
-        ) {
-            Ok(handle) => {
-                self.pending_benchmark_run = Some(handle);
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to start dsperse benchmark run");
-                self.dsperse_benchmark_backoff_until = Instant::now() + Duration::from_secs(60);
-            }
+        if total_elements == 0 {
+            warn!(circuit = %circuit.id, "cannot derive tensor size from input_schema");
+            return;
         }
+
+        let zeros = ndarray::ArrayD::zeros(ndarray::IxDyn(&[1, total_elements]));
+        let slices_dir = circuit.paths.base_path.join("slices");
+
+        let incremental = match dsperse::pipeline::IncrementalRun::new(&slices_dir, zeros) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, circuit = %circuit.id, "failed to create benchmark IncrementalRun");
+                self.dsperse_benchmark_backoff_until = Instant::now() + Duration::from_secs(60);
+                return;
+            }
+        };
+
+        let run_uid = uuid::Uuid::new_v4().to_string();
+        info!(run_uid = %run_uid, circuit = %circuit.id, name = %circuit.metadata.name, "started dsperse benchmark run");
+
+        self.run_manager.start_run(
+            run_uid.clone(),
+            circuit.id.clone(),
+            circuit.metadata.name.clone(),
+            RunSource::Benchmark,
+            None,
+            Some(incremental),
+        );
+
+        let circuit = circuit.clone();
+        self.enqueue_next_dslice(&run_uid, &circuit).await;
+        self.dispatch_notify.notify_one();
     }
 
     async fn dispatch_requests(&mut self) -> Result<()> {
@@ -818,14 +693,14 @@ impl ValidatorLoop {
                     task_id = dslice.task_id.clone();
                     tile_idx = dslice.tile_idx;
                     task_circuit = Some(dslice.circuit.clone());
-                    task_inputs = None;
-                    task_inputs_path = dslice.inputs_path.clone();
+                    task_inputs = Some(dslice.inputs.clone());
+                    task_inputs_path = None;
                     task_proof_system = Some(dslice.proof_system);
                     synapse_name = DSliceProofGenerationDataModel::NAME;
                     let dslice_model = self.pipeline.prepare_dslice_request(
                         uid,
                         &dslice.circuit,
-                        serde_json::Value::Null,
+                        dslice.inputs.clone(),
                         None,
                         &dslice.slice_num,
                         &dslice.run_uid,
@@ -852,14 +727,14 @@ impl ValidatorLoop {
                     task_id = dslice.task_id.clone();
                     tile_idx = dslice.tile_idx;
                     task_circuit = Some(dslice.circuit.clone());
-                    task_inputs = None;
-                    task_inputs_path = dslice.inputs_path.clone();
+                    task_inputs = Some(dslice.inputs.clone());
+                    task_inputs_path = None;
                     task_proof_system = Some(dslice.proof_system);
                     synapse_name = DSliceProofGenerationDataModel::NAME;
                     let dslice_model = self.pipeline.prepare_dslice_request(
                         uid,
                         &dslice.circuit,
-                        serde_json::Value::Null,
+                        dslice.inputs.clone(),
                         None,
                         &dslice.slice_num,
                         &dslice.run_uid,
@@ -936,42 +811,19 @@ impl ValidatorLoop {
                 };
 
                 let client = Arc::clone(&self.miner_client);
-                let file_sem = Arc::clone(&self.file_load_semaphore);
 
                 let task_slice_num = slice_num.clone();
                 let task_run_uid = run_uid.clone();
                 let task_task_id = task_id.clone();
                 let task_circuit_clone = task_circuit;
                 let task_inputs_clone = task_inputs;
-                let task_inputs_path_clone = task_inputs_path;
+                let task_inputs_path_clone: Option<String> = None;
                 let task_proof_system_clone = task_proof_system;
                 let task_retry_payload = retry_payload;
                 let task_guard_hash = guard_hash.clone();
 
                 let abort_handle = self.tasks.spawn(async move {
                     let tokio_task_id = tokio::task::id();
-
-                    let _file_permit = if request_type == RequestType::DSlice
-                        && task_inputs_path_clone.is_some()
-                    {
-                        Some(file_sem.acquire().await)
-                    } else {
-                        None
-                    };
-
-                    let mut body = body;
-                    if request_type == RequestType::DSlice {
-                        if let Some(ref path) = task_inputs_path_clone {
-                            match load_json_from_path(path).await {
-                                Some(inputs) => {
-                                    body["inputs"] = inputs;
-                                }
-                                None => {
-                                    warn!(uid, path = %path, "dslice input file load failed, sending null inputs");
-                                }
-                            }
-                        }
-                    }
 
                     let guard = client.read().await;
                     let query_result = if protocol > 0 {
@@ -1179,10 +1031,7 @@ impl ValidatorLoop {
 
         let failed = match result.outcome {
             TaskOutcome::Success(ref mut response) => {
-                let verify_result = self
-                    .response_processor
-                    .verify_response(response, &self.dsperse)
-                    .await;
+                let verify_result = self.response_processor.verify_response(response).await;
                 let verified = matches!(verify_result, Ok(true));
                 response.verification_result = verified;
 
@@ -1341,8 +1190,8 @@ impl ValidatorLoop {
         &mut self,
         run_uid: &Option<String>,
         slice_num: &Option<String>,
-        is_tile: bool,
-        task_id: Option<&str>,
+        _is_tile: bool,
+        _task_id: Option<&str>,
         tile_idx: Option<u32>,
         response: &MinerResponse,
         verification_time: f64,
@@ -1357,7 +1206,6 @@ impl ValidatorLoop {
         };
 
         let proof_str = response.proof_content.as_ref().and_then(|v| v.as_str());
-        let proof_system_str = response.proof_system.as_ref().map(|ps| ps.to_string());
 
         if !self.run_manager.has_run(&run_uid) {
             let (cid, cname) = response
@@ -1365,8 +1213,14 @@ impl ValidatorLoop {
                 .as_ref()
                 .map(|c| (c.id.clone(), c.metadata.name.clone()))
                 .unwrap_or_default();
-            self.run_manager
-                .start_run(run_uid.clone(), cid, cname, RunSource::Benchmark, None);
+            self.run_manager.start_run(
+                run_uid.clone(),
+                cid,
+                cname,
+                RunSource::Benchmark,
+                None,
+                None,
+            );
         }
 
         self.run_manager.push_artifact(
@@ -1383,49 +1237,21 @@ impl ValidatorLoop {
             },
         );
 
-        let apply_result = if is_tile {
-            let tid = task_id.unwrap_or("");
-            let tidx = tile_idx.unwrap_or(0);
-            self.dsperse
-                .apply_tile_result(
-                    &run_uid,
-                    tid,
-                    &slice_num,
-                    tidx,
-                    true,
-                    response.computed_outputs.as_ref(),
-                    proof_str,
-                    response.witness.as_deref(),
-                    proof_system_str.as_deref(),
-                    response.response_time,
-                    verification_time,
-                )
-                .await
-        } else {
-            self.dsperse
-                .apply_slice_result(
-                    &run_uid,
-                    &slice_num,
-                    true,
-                    response.computed_outputs.as_ref(),
-                    proof_str,
-                    proof_system_str.as_deref(),
-                    response.response_time,
-                    verification_time,
-                )
-                .await
-        };
+        let computed = response
+            .computed_outputs
+            .as_ref()
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
 
-        match apply_result {
-            Ok(status) => {
-                let is_complete = status
-                    .get("is_complete")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-
+        match self
+            .run_manager
+            .apply_result(&run_uid, &slice_num, &computed)
+        {
+            Ok(is_complete) => {
                 if is_complete {
                     info!(run_uid = %run_uid, "incremental run complete");
 
+                    let final_output = self.run_manager.final_output_json(&run_uid);
                     let artifacts = self.run_manager.take_artifacts(&run_uid);
                     let active_run = self.run_manager.remove_run(&run_uid);
 
@@ -1440,7 +1266,6 @@ impl ValidatorLoop {
                             .as_ref()
                             .map(|r| r.circuit_name.clone())
                             .unwrap_or_default();
-                        let final_output = status.get("final_output").cloned();
 
                         self.upload_tasks.spawn(async move {
                             if let Err(e) = uploader
@@ -1481,7 +1306,7 @@ impl ValidatorLoop {
                         )
                         .await;
                 } else {
-                    self.enqueue_dsperse_work_from_status(&run_uid).await;
+                    self.enqueue_next_dslice_from_run(&run_uid).await;
                 }
             }
             Err(e) => {
@@ -1490,19 +1315,17 @@ impl ValidatorLoop {
         }
     }
 
-    async fn enqueue_dsperse_work_from_status(&mut self, run_uid: &str) {
-        match self.dsperse.get_run_status(run_uid).await {
-            Ok(status) => {
-                let circuit_id = status
-                    .get("circuit_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                if let Some(circuit) = self.circuit_store.get_circuit(circuit_id).cloned() {
-                    self.enqueue_dsperse_work(run_uid, &circuit).await;
-                }
-            }
-            Err(e) => {
-                warn!(run_uid = %run_uid, error = %e, "failed to get run status for re-enqueue");
+    async fn enqueue_next_dslice_from_run(&mut self, run_uid: &str) {
+        if !self.run_manager.has_run(run_uid) {
+            return;
+        }
+        let circuit_id = self
+            .run_manager
+            .get_circuit_id(run_uid)
+            .map(|s| s.to_string());
+        if let Some(cid) = circuit_id {
+            if let Some(circuit) = self.circuit_store.get_circuit(&cid).cloned() {
+                self.enqueue_next_dslice(run_uid, &circuit).await;
             }
         }
     }
@@ -1515,10 +1338,10 @@ impl ValidatorLoop {
         retry_count: u32,
         retry_payload: RetryPayload,
         run_uid: &Option<String>,
-        slice_num: &Option<String>,
-        is_tile: bool,
-        task_id: Option<&str>,
-        tile_idx: Option<u32>,
+        _slice_num: &Option<String>,
+        _is_tile: bool,
+        _task_id: Option<&str>,
+        _tile_idx: Option<u32>,
         external_request_hash: Option<&str>,
         reason: &str,
     ) {
@@ -1571,24 +1394,7 @@ impl ValidatorLoop {
 
         if request_type == RequestType::DSlice {
             if let Some(run_uid) = run_uid {
-                let slice = slice_num.as_deref().unwrap_or("0");
-
-                if is_tile {
-                    let tid = task_id.unwrap_or("");
-                    let tidx = tile_idx.unwrap_or(0);
-                    let _ = self
-                        .dsperse
-                        .apply_tile_result(
-                            run_uid, tid, slice, tidx, false, None, None, None, None, 0.0, 0.0,
-                        )
-                        .await;
-                } else {
-                    let _ = self
-                        .dsperse
-                        .apply_slice_result(run_uid, slice, false, None, None, None, 0.0, 0.0)
-                        .await;
-                }
-
+                warn!(run_uid = %run_uid, "dslice max retries exceeded, removing run");
                 self.run_manager.remove_run(run_uid);
                 self.relay.remove_pending(run_uid).await;
             }
@@ -1703,50 +1509,6 @@ impl ValidatorLoop {
         while let Some(result) = self.upload_tasks.try_join_next() {
             if let Err(e) = result {
                 warn!(error = %e, "upload task panicked");
-            }
-        }
-
-        if let Some(handle) = &mut self.pending_benchmark_run {
-            if handle.handle.is_finished() {
-                let taken = self.pending_benchmark_run.take().unwrap();
-                match taken.handle.await {
-                    Ok(Ok(result)) => {
-                        if let Some(err) = result.get("error") {
-                            warn!(error = %err, "dsperse benchmark run returned error");
-                            self.dsperse_benchmark_backoff_until =
-                                Instant::now() + Duration::from_secs(60);
-                        } else {
-                            let run_uid = result
-                                .get("run_uid")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string();
-                            info!(run_uid = %run_uid, circuit = %taken.circuit_id, "dsperse benchmark run started");
-                            self.run_manager.start_run(
-                                run_uid.clone(),
-                                taken.circuit_id.clone(),
-                                taken.circuit_name.clone(),
-                                RunSource::Benchmark,
-                                None,
-                            );
-                            if let Some(circuit) = self.circuit_store.get_circuit(&taken.circuit_id)
-                            {
-                                let circuit = circuit.clone();
-                                self.enqueue_dsperse_work(&run_uid, &circuit).await;
-                            }
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        warn!(error = %e, "dsperse benchmark run IPC failed");
-                        self.dsperse_benchmark_backoff_until =
-                            Instant::now() + Duration::from_secs(60);
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "dsperse benchmark run task panicked");
-                        self.dsperse_benchmark_backoff_until =
-                            Instant::now() + Duration::from_secs(60);
-                    }
-                }
             }
         }
 
@@ -2040,26 +1802,6 @@ impl ValidatorLoop {
         }
         self.performance_tracker.save();
     }
-}
-
-async fn load_json_from_path(path: &str) -> Option<serde_json::Value> {
-    let path = path.to_string();
-    tokio::task::spawn_blocking(move || match std::fs::read(&path) {
-        Ok(data) => match serde_json::from_slice(&data) {
-            Ok(val) => Some(val),
-            Err(e) => {
-                warn!(path = %path, error = %e, "failed to parse JSON from file");
-                None
-            }
-        },
-        Err(e) => {
-            warn!(path = %path, error = %e, "failed to read data file");
-            None
-        }
-    })
-    .await
-    .ok()
-    .flatten()
 }
 
 fn is_valid_ip(ip_str: &str) -> bool {

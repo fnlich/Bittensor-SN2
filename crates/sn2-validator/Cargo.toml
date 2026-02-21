@@ -34,3 +34,5 @@ rand = { workspace = true }
 dirs-next = { workspace = true }
 futures-util = { workspace = true }
 shellexpand = { workspace = true }
+dsperse = { workspace = true }
+ndarray = { workspace = true }

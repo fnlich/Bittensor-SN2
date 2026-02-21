@@ -4,8 +4,6 @@ use anyhow::Result;
 use sn2_types::{MinerResponse, ProofSystem};
 use tracing::warn;
 
-use crate::dsperse::DSperseManager;
-
 pub struct ResponseProcessor;
 
 impl ResponseProcessor {
@@ -13,21 +11,13 @@ impl ResponseProcessor {
         Self
     }
 
-    pub async fn verify_response(
-        &self,
-        response: &mut MinerResponse,
-        dsperse: &DSperseManager,
-    ) -> Result<bool> {
+    pub async fn verify_response(&self, response: &mut MinerResponse) -> Result<bool> {
         if response.proof_content.is_none() {
             anyhow::bail!("empty proof from miner {}", response.uid);
         }
 
         let start = Instant::now();
-        let result = if response.is_incremental {
-            self.verify_incremental(response, dsperse).await
-        } else {
-            self.verify_standard(response).await
-        };
+        let result = self.verify_standard(response).await;
         response.verification_time = Some(start.elapsed().as_secs_f64());
         result
     }
@@ -53,7 +43,7 @@ impl ResponseProcessor {
             None => {
                 warn!(
                     uid = response.uid,
-                    "no circuit data for standard verification, accepting proof"
+                    "no circuit data for verification, accepting proof"
                 );
                 return Ok(!proof_hex.is_empty());
             }
@@ -63,8 +53,24 @@ impl ResponseProcessor {
             return Ok(!proof_hex.is_empty());
         }
 
-        let circuit_path = circuit.paths.compiled_model.to_string_lossy().to_string();
-        if !circuit.paths.compiled_model.exists() {
+        let circuit_path = if response.is_incremental {
+            let slice_num = response.dsperse_slice_num.unwrap_or(0);
+            let slice_model = circuit
+                .paths
+                .base_path
+                .join("slices")
+                .join(format!("slice_{slice_num}"))
+                .join("model.compiled");
+            if slice_model.exists() {
+                slice_model.to_string_lossy().to_string()
+            } else {
+                circuit.paths.compiled_model.to_string_lossy().to_string()
+            }
+        } else {
+            circuit.paths.compiled_model.to_string_lossy().to_string()
+        };
+
+        if !std::path::Path::new(&circuit_path).exists() {
             warn!(uid = response.uid, path = %circuit_path, "compiled model not found, accepting proof");
             return Ok(!proof_hex.is_empty());
         }
@@ -107,86 +113,7 @@ impl ResponseProcessor {
                 Ok(true)
             }
             Err(e) => {
-                warn!(uid = response.uid, error = %e, "standard verification failed");
-                Ok(false)
-            }
-        }
-    }
-
-    async fn verify_incremental(
-        &self,
-        response: &mut MinerResponse,
-        dsperse: &DSperseManager,
-    ) -> Result<bool> {
-        let witness_hex = match &response.witness {
-            Some(w) if !w.is_empty() => w.clone(),
-            _ => {
-                anyhow::bail!(
-                    "incremental response from miner {} missing witness",
-                    response.uid
-                );
-            }
-        };
-
-        let proof_hex = response
-            .proof_content
-            .as_ref()
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-
-        if proof_hex.is_empty() {
-            return Ok(false);
-        }
-
-        let circuit = match &response.circuit {
-            Some(c) => c,
-            None => {
-                warn!(
-                    uid = response.uid,
-                    "no circuit data for incremental verification"
-                );
-                return Ok(false);
-            }
-        };
-
-        let slice_num = response.dsperse_slice_num.unwrap_or(0).to_string();
-        let inputs = match &response.inputs {
-            Some(v) if !v.is_null() => v.clone(),
-            _ => match &response.inputs_path {
-                Some(path) => match std::fs::read(path) {
-                    Ok(data) => serde_json::from_slice(&data).unwrap_or(serde_json::Value::Null),
-                    Err(e) => {
-                        warn!(uid = response.uid, path = %path, error = %e, "failed to read inputs file for verification");
-                        serde_json::Value::Null
-                    }
-                },
-                None => serde_json::Value::Null,
-            },
-        };
-        let proof_system_str = response.proof_system.as_ref().map(|ps| ps.to_string());
-
-        match dsperse
-            .verify_incremental_slice_with_witness(
-                &circuit.id,
-                &slice_num,
-                &inputs,
-                &witness_hex,
-                proof_hex,
-                proof_system_str.as_deref(),
-                response.dsperse_run_uid.as_deref(),
-            )
-            .await
-        {
-            Ok((success, extracted_outputs)) => {
-                if success {
-                    if let Some(outputs) = extracted_outputs {
-                        response.computed_outputs = Some(outputs);
-                    }
-                }
-                Ok(success)
-            }
-            Err(e) => {
-                warn!(uid = response.uid, error = %e, "incremental verification IPC failed");
+                warn!(uid = response.uid, error = %e, "verification failed");
                 Ok(false)
             }
         }

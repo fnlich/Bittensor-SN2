@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use dsperse::pipeline::{IncrementalRun, SliceExecutionResult, SliceWork};
+use dsperse::schema::execution::ExecutionInfo;
+use dsperse::utils::io::{arrayd_to_json, json_to_arrayd};
 use sn2_types::{ProofSystem, RunSource};
 use tracing::{info, warn};
 
@@ -25,6 +28,12 @@ pub struct ActiveRun {
     pub started_at: Instant,
     pub artifacts: Vec<SliceArtifact>,
     pub relay_request_id: Option<String>,
+    pub incremental: Option<IncrementalRun>,
+}
+
+pub struct NextSliceInfo {
+    pub slice_id: String,
+    pub inputs_json: serde_json::Value,
 }
 
 #[derive(Default)]
@@ -44,6 +53,7 @@ impl IncrementalRunManager {
         circuit_name: String,
         run_source: RunSource,
         relay_request_id: Option<String>,
+        incremental: Option<IncrementalRun>,
     ) {
         if self.runs.contains_key(&run_uid) {
             warn!(
@@ -63,12 +73,71 @@ impl IncrementalRunManager {
                 started_at: Instant::now(),
                 artifacts: Vec::new(),
                 relay_request_id,
+                incremental,
             },
         );
     }
 
     pub fn has_run(&self, run_uid: &str) -> bool {
         self.runs.contains_key(run_uid)
+    }
+
+    pub fn get_circuit_id(&self, run_uid: &str) -> Option<&str> {
+        self.runs.get(run_uid).map(|r| r.circuit_id.as_str())
+    }
+
+    pub fn next_slice(&self, run_uid: &str) -> Option<NextSliceInfo> {
+        let run = self.runs.get(run_uid)?;
+        let inc = run.incremental.as_ref()?;
+        let work: SliceWork = inc.next_slice()?;
+        let inputs_json = serde_json::json!({
+            "input_data": arrayd_to_json(&work.input)
+        });
+        Some(NextSliceInfo {
+            slice_id: work.slice_id,
+            inputs_json,
+        })
+    }
+
+    pub fn apply_result(
+        &mut self,
+        run_uid: &str,
+        slice_id: &str,
+        computed_outputs: &serde_json::Value,
+    ) -> anyhow::Result<bool> {
+        let run = self
+            .runs
+            .get_mut(run_uid)
+            .ok_or_else(|| anyhow::anyhow!("unknown run {run_uid}"))?;
+        let inc = run
+            .incremental
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("run {run_uid} has no IncrementalRun"))?;
+
+        let output_tensor = json_to_arrayd(computed_outputs)
+            .map_err(|e| anyhow::anyhow!("output tensor conversion: {e}"))?;
+
+        inc.apply_result(SliceExecutionResult {
+            slice_id: slice_id.to_string(),
+            output: output_tensor,
+            execution_info: ExecutionInfo {
+                method: "remote_miner".to_string(),
+                success: true,
+                error: None,
+                witness_file: None,
+                tile_exec_infos: Vec::new(),
+            },
+        })
+        .map_err(|e| anyhow::anyhow!("apply_result: {e}"))?;
+
+        Ok(inc.is_complete())
+    }
+
+    pub fn final_output_json(&self, run_uid: &str) -> Option<serde_json::Value> {
+        let run = self.runs.get(run_uid)?;
+        let inc = run.incremental.as_ref()?;
+        let output = inc.final_output()?;
+        Some(arrayd_to_json(output))
     }
 
     pub fn push_artifact(&mut self, run_uid: &str, artifact: SliceArtifact) {
