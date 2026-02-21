@@ -806,12 +806,6 @@ impl ValidatorLoop {
                     }
                 } else if api_eligible.contains(&uid) && !self.api_dslice_queue.is_empty() {
                     let dslice = self.api_dslice_queue.pop_front().unwrap();
-                    let loaded_inputs = match dslice.inputs_path.as_deref() {
-                        Some(p) => load_json_from_path(p)
-                            .await
-                            .unwrap_or(serde_json::Value::Null),
-                        None => serde_json::Value::Null,
-                    };
                     retry_payload = RetryPayload::DSlice(Box::new(dslice.clone()));
                     request_type = RequestType::DSlice;
                     external_request_hash = None;
@@ -829,25 +823,23 @@ impl ValidatorLoop {
                     let dslice_model = self.pipeline.prepare_dslice_request(
                         uid,
                         &dslice.circuit,
-                        loaded_inputs,
+                        serde_json::Value::Null,
                         None,
                         &dslice.slice_num,
                         &dslice.run_uid,
                         dslice.proof_system,
                     );
                     body = serde_json::to_value(&dslice_model).unwrap_or_default();
-                    guard_hash = self.pipeline.check_hash(&body);
+                    guard_hash = self.pipeline.check_dslice_hash(
+                        &dslice.circuit.id,
+                        &dslice.slice_num,
+                        &dslice.run_uid,
+                    );
                     if guard_hash.is_none() {
                         self.api_dslice_queue.push_back(dslice);
                         break;
                     }
                 } else if let Some(dslice) = self.stacked_dslice_queue.pop_front() {
-                    let loaded_inputs = match dslice.inputs_path.as_deref() {
-                        Some(p) => load_json_from_path(p)
-                            .await
-                            .unwrap_or(serde_json::Value::Null),
-                        None => serde_json::Value::Null,
-                    };
                     retry_payload = RetryPayload::DSlice(Box::new(dslice.clone()));
                     request_type = RequestType::DSlice;
                     external_request_hash = None;
@@ -865,14 +857,18 @@ impl ValidatorLoop {
                     let dslice_model = self.pipeline.prepare_dslice_request(
                         uid,
                         &dslice.circuit,
-                        loaded_inputs,
+                        serde_json::Value::Null,
                         None,
                         &dslice.slice_num,
                         &dslice.run_uid,
                         dslice.proof_system,
                     );
                     body = serde_json::to_value(&dslice_model).unwrap_or_default();
-                    guard_hash = self.pipeline.check_hash(&body);
+                    guard_hash = self.pipeline.check_dslice_hash(
+                        &dslice.circuit.id,
+                        &dslice.slice_num,
+                        &dslice.run_uid,
+                    );
                     if guard_hash.is_none() {
                         self.stacked_dslice_queue.push_back(dslice);
                         break;
@@ -951,6 +947,21 @@ impl ValidatorLoop {
 
                 let abort_handle = self.tasks.spawn(async move {
                     let tokio_task_id = tokio::task::id();
+
+                    let mut body = body;
+                    if request_type == RequestType::DSlice {
+                        if let Some(ref path) = task_inputs_path_clone {
+                            match load_json_from_path(path).await {
+                                Some(inputs) => {
+                                    body["inputs"] = inputs;
+                                }
+                                None => {
+                                    warn!(uid, path = %path, "dslice input file load failed, sending null inputs");
+                                }
+                            }
+                        }
+                    }
+
                     let guard = client.read().await;
                     let query_result = if protocol > 0 {
                         let axon = QuicAxonInfo {

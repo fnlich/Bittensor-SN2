@@ -39,6 +39,26 @@ impl RequestPipeline {
         Some(hash)
     }
 
+    pub fn check_dslice_hash(
+        &mut self,
+        circuit_id: &str,
+        slice_num: &str,
+        run_uid: &str,
+    ) -> Option<String> {
+        let mut hasher = Sha256::new();
+        hasher.update(circuit_id.as_bytes());
+        hasher.update(b":");
+        hasher.update(slice_num.as_bytes());
+        hasher.update(b":");
+        hasher.update(run_uid.as_bytes());
+        let hash = hex::encode(hasher.finalize());
+        if self.hash_guard.contains(&hash) {
+            return None;
+        }
+        self.insert_hash(hash.clone());
+        Some(hash)
+    }
+
     pub fn prepare_benchmark_request(
         &mut self,
         circuit: &Circuit,
