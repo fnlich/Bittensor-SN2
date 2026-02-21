@@ -1762,6 +1762,9 @@ impl ValidatorLoop {
             info!("TARGET_UIDS set, skipping non-queryable score zeroing");
         } else {
             let queryable = self.get_queryable_neurons();
+            for n in &queryable {
+                info!(uid = n.uid, ip = %n.axon_ip, port = n.axon_port, protocol = n.axon_protocol, active = n.is_active, "queryable neuron");
+            }
             let queryable_uids: HashSet<u16> = queryable.iter().map(|n| n.uid).collect();
             self.score_manager.zero_non_queryable(&queryable_uids);
         }
@@ -1784,13 +1787,26 @@ impl ValidatorLoop {
             self.uid_hotkeys.insert(neuron.uid, neuron.hotkey.clone());
         }
 
+        let active_count = self.config.metagraph.active_neurons().count();
+        let axon_count = self
+            .config
+            .metagraph
+            .active_neurons()
+            .filter(|n| !n.axon_ip.is_empty() && n.axon_port > 0)
+            .count();
         metrics::set_metagraph_n(self.config.metagraph.n);
-        info!(n = self.config.metagraph.n, "metagraph synced");
+        info!(
+            n = self.config.metagraph.n,
+            active = active_count,
+            with_axon = axon_count,
+            "metagraph synced"
+        );
 
         let quic_miners: Vec<QuicAxonInfo> = self
             .config
             .metagraph
-            .active_neurons()
+            .neurons
+            .iter()
             .filter(|n| n.axon_protocol > 0 && !n.axon_ip.is_empty())
             .map(|n| QuicAxonInfo {
                 hotkey: n.hotkey.clone(),
