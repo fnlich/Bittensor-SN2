@@ -806,13 +806,12 @@ impl ValidatorLoop {
                     }
                 } else if api_eligible.contains(&uid) && !self.api_dslice_queue.is_empty() {
                     let dslice = self.api_dslice_queue.pop_front().unwrap();
-                    let loaded_inputs = dslice
-                        .inputs_path
-                        .as_deref()
-                        .and_then(load_json_from_path)
-                        .unwrap_or(serde_json::Value::Null);
-                    let loaded_outputs =
-                        dslice.outputs_path.as_deref().and_then(load_json_from_path);
+                    let loaded_inputs = match dslice.inputs_path.as_deref() {
+                        Some(p) => load_json_from_path(p)
+                            .await
+                            .unwrap_or(serde_json::Value::Null),
+                        None => serde_json::Value::Null,
+                    };
                     retry_payload = RetryPayload::DSlice(Box::new(dslice.clone()));
                     request_type = RequestType::DSlice;
                     external_request_hash = None;
@@ -831,7 +830,7 @@ impl ValidatorLoop {
                         uid,
                         &dslice.circuit,
                         loaded_inputs,
-                        loaded_outputs,
+                        None,
                         &dslice.slice_num,
                         &dslice.run_uid,
                         dslice.proof_system,
@@ -843,13 +842,12 @@ impl ValidatorLoop {
                         break;
                     }
                 } else if let Some(dslice) = self.stacked_dslice_queue.pop_front() {
-                    let loaded_inputs = dslice
-                        .inputs_path
-                        .as_deref()
-                        .and_then(load_json_from_path)
-                        .unwrap_or(serde_json::Value::Null);
-                    let loaded_outputs =
-                        dslice.outputs_path.as_deref().and_then(load_json_from_path);
+                    let loaded_inputs = match dslice.inputs_path.as_deref() {
+                        Some(p) => load_json_from_path(p)
+                            .await
+                            .unwrap_or(serde_json::Value::Null),
+                        None => serde_json::Value::Null,
+                    };
                     retry_payload = RetryPayload::DSlice(Box::new(dslice.clone()));
                     request_type = RequestType::DSlice;
                     external_request_hash = None;
@@ -868,7 +866,7 @@ impl ValidatorLoop {
                         uid,
                         &dslice.circuit,
                         loaded_inputs,
-                        loaded_outputs,
+                        None,
                         &dslice.slice_num,
                         &dslice.run_uid,
                         dslice.proof_system,
@@ -2022,8 +2020,9 @@ impl ValidatorLoop {
     }
 }
 
-fn load_json_from_path(path: &str) -> Option<serde_json::Value> {
-    match std::fs::read(path) {
+async fn load_json_from_path(path: &str) -> Option<serde_json::Value> {
+    let path = path.to_string();
+    tokio::task::spawn_blocking(move || match std::fs::read(&path) {
         Ok(data) => match serde_json::from_slice(&data) {
             Ok(val) => Some(val),
             Err(e) => {
@@ -2035,7 +2034,10 @@ fn load_json_from_path(path: &str) -> Option<serde_json::Value> {
             warn!(path = %path, error = %e, "failed to read data file");
             None
         }
-    }
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 fn is_valid_ip(ip_str: &str) -> bool {
