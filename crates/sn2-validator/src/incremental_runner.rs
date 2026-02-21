@@ -86,6 +86,10 @@ impl IncrementalRunManager {
         self.runs.get(run_uid).map(|r| r.circuit_id.as_str())
     }
 
+    pub fn get_run_source(&self, run_uid: &str) -> Option<RunSource> {
+        self.runs.get(run_uid).map(|r| r.run_source)
+    }
+
     pub fn next_slice(&self, run_uid: &str) -> anyhow::Result<Option<NextSliceInfo>> {
         let run = match self.runs.get(run_uid) {
             Some(r) => r,

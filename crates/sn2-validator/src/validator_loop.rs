@@ -445,8 +445,7 @@ impl ValidatorLoop {
 
         let run_source = self
             .run_manager
-            .has_run(run_uid)
-            .then(|| RunSource::Api)
+            .get_run_source(run_uid)
             .unwrap_or(RunSource::Benchmark);
 
         let request = DSliceRequest {
