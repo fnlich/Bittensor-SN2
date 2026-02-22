@@ -25,7 +25,11 @@ impl DSperseClient {
             .cache_dir
             .join(format!("model_{circuit_id}"))
             .join("slices");
-        let slice_idx: usize = slice_num.parse().context("parsing slice_num")?;
+        let slice_idx: usize = slice_num
+            .strip_prefix("slice_")
+            .unwrap_or(slice_num)
+            .parse()
+            .context("parsing slice_num")?;
         let slice_id = format!("slice_{slice_idx}");
 
         dsperse::archive::extract_single_slice(&slices_dir, &slice_id, None)
