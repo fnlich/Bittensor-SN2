@@ -686,23 +686,24 @@ impl ValidatorLoop {
             }
         };
 
-        let total_elements: usize = schema
+        let shape: Vec<usize> = match schema
             .get("shape")
             .and_then(|v| v.as_array())
-            .map(|dims| {
+            .and_then(|dims| {
                 dims.iter()
-                    .filter_map(|d| d.as_u64())
-                    .map(|d| d as usize)
-                    .product()
+                    .map(|d| d.as_u64().map(|v| v as usize))
+                    .collect::<Option<Vec<_>>>()
             })
-            .unwrap_or(0);
+            .filter(|s| !s.is_empty() && s.iter().all(|&d| d > 0))
+        {
+            Some(s) => s,
+            None => {
+                warn!(circuit = %circuit.id, "cannot derive tensor shape from input_schema");
+                return;
+            }
+        };
 
-        if total_elements == 0 {
-            warn!(circuit = %circuit.id, "cannot derive tensor size from input_schema");
-            return;
-        }
-
-        let zeros = ndarray::ArrayD::zeros(ndarray::IxDyn(&[1, total_elements]));
+        let zeros = ndarray::ArrayD::zeros(ndarray::IxDyn(&shape));
         let slices_dir = circuit.paths.base_path.join("slices");
 
         let incremental = match dsperse::pipeline::IncrementalRun::new(&slices_dir, zeros) {
