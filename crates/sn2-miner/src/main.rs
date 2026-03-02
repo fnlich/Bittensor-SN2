@@ -108,6 +108,15 @@ async fn main() -> Result<()> {
     let quic_port = cli.quic_port;
 
     let dsperse = dsperse::DSperseClient::new();
+
+    let mut circuit_store =
+        sn2_circuit_store::CircuitStore::new(None, false, cli.additional_circuits.clone());
+    for id in &cli.additional_circuits {
+        if let Err(e) = circuit_store.ensure_circuit(id).await {
+            warn!(id = %id, error = %e, "failed to preload pinned circuit");
+        }
+    }
+
     let circuit_mgr = std::sync::Arc::new(circuit_manager::CircuitManager::new(
         &cli.circuit_dir,
         cli.storage_bucket.as_deref(),
@@ -115,7 +124,7 @@ async fn main() -> Result<()> {
 
     let circuit_monitor = circuit_mgr.clone().start_monitor();
 
-    let handlers = handlers::MinerHandlers::new(dsperse, circuit_mgr);
+    let handlers = handlers::MinerHandlers::new(dsperse, circuit_mgr, circuit_store);
     let handlers = std::sync::Arc::new(handlers);
 
     let disable_blacklist = cli.disable_blacklist;
@@ -222,6 +231,15 @@ async fn run_loopback(cli: Cli) -> Result<()> {
     );
 
     let dsperse = dsperse::DSperseClient::new();
+
+    let mut circuit_store =
+        sn2_circuit_store::CircuitStore::new(None, true, cli.additional_circuits.clone());
+    for id in &cli.additional_circuits {
+        if let Err(e) = circuit_store.ensure_circuit(id).await {
+            warn!(id = %id, error = %e, "failed to preload pinned circuit");
+        }
+    }
+
     let circuit_mgr = std::sync::Arc::new(circuit_manager::CircuitManager::new(
         &cli.circuit_dir,
         cli.storage_bucket.as_deref(),
@@ -229,7 +247,7 @@ async fn run_loopback(cli: Cli) -> Result<()> {
 
     let circuit_monitor = circuit_mgr.clone().start_monitor();
 
-    let handlers = handlers::MinerHandlers::new(dsperse, circuit_mgr);
+    let handlers = handlers::MinerHandlers::new(dsperse, circuit_mgr, circuit_store);
     let handlers = std::sync::Arc::new(handlers);
 
     let metagraph = Arc::new(RwLock::new(sn2_chain::Metagraph::new(cli.netuid)));
