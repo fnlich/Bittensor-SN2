@@ -19,10 +19,15 @@ pub struct CircuitStore {
     http: reqwest::Client,
     loopback: bool,
     api_url_overridden: bool,
+    pinned_ids: std::collections::HashSet<String>,
 }
 
 impl CircuitStore {
-    pub fn new(api_url_override: Option<&str>, loopback: bool) -> Self {
+    pub fn new(
+        api_url_override: Option<&str>,
+        loopback: bool,
+        additional_circuits: Vec<String>,
+    ) -> Self {
         let cache_dir = shellexpand::tilde(CIRCUIT_CACHE_DIR).to_string();
         let api_url_overridden = api_url_override.is_some();
         Self {
@@ -35,6 +40,11 @@ impl CircuitStore {
                 .unwrap_or_default(),
             loopback,
             api_url_overridden,
+            pinned_ids: additional_circuits
+                .into_iter()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect(),
         }
     }
 
@@ -46,17 +56,52 @@ impl CircuitStore {
             return Ok(());
         }
 
-        let api_circuits = self.fetch_circuits_from_api().await.unwrap_or_else(|e| {
+        let mut api_circuits = self.fetch_circuits_from_api().await.unwrap_or_else(|e| {
             warn!(error = %e, "failed to fetch circuits from API, loading from cache only");
             Vec::new()
         });
 
-        let active_ids: std::collections::HashSet<String> = api_circuits
+        let mut active_ids: std::collections::HashSet<String> = api_circuits
             .iter()
             .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(String::from))
             .collect();
 
-        self.load_from_cache(&active_ids);
+        for pinned_id in &self.pinned_ids {
+            if active_ids.contains(pinned_id) {
+                continue;
+            }
+            info!(id = %pinned_id, "fetching pinned circuit from API");
+            let url = format!("{}/circuits/{}", self.api_url, pinned_id);
+            match self.http.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<serde_json::Value>().await {
+                        Ok(data) => {
+                            active_ids.insert(pinned_id.clone());
+                            api_circuits.push(data);
+                        }
+                        Err(e) => {
+                            warn!(id = %pinned_id, error = %e, "failed to parse pinned circuit response");
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    warn!(id = %pinned_id, status = %resp.status(), "failed to fetch pinned circuit");
+                }
+                Err(e) => {
+                    warn!(id = %pinned_id, error = %e, "failed to fetch pinned circuit");
+                }
+            }
+        }
+
+        if active_ids.is_empty() {
+            self.load_from_cache(&active_ids);
+        } else {
+            let mut load_ids = active_ids.clone();
+            for id in &self.pinned_ids {
+                load_ids.insert(id.clone());
+            }
+            self.load_from_cache(&load_ids);
+        }
 
         for circuit_data in &api_circuits {
             if let Some(id) = circuit_data.get("id").and_then(|v| v.as_str()) {
@@ -149,7 +194,9 @@ impl CircuitStore {
         let removed: Vec<String> = self
             .circuits
             .keys()
-            .filter(|id| !active_ids.contains(id.as_str()))
+            .filter(|id| {
+                !active_ids.contains(id.as_str()) && !self.pinned_ids.contains(id.as_str())
+            })
             .cloned()
             .collect();
 
