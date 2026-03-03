@@ -1081,7 +1081,7 @@ impl ValidatorLoop {
                             }
                             TaskOutcome::Success(Box::new(response))
                         }
-                        Err(e) => TaskOutcome::Failure(e.to_string()),
+                        Err(e) => TaskOutcome::Failure(format!("{e:#}")),
                     };
 
                     TaskResult {
@@ -1751,6 +1751,12 @@ impl ValidatorLoop {
 
             if self.pending_reveal.is_some() && !weight_op_in_flight {
                 if let Err(e) = self.try_reveal_weights().await {
+                    if sn2_chain::is_rpc_disconnect(&e) {
+                        warn!(error = ?e, "chain RPC disconnected during weight reveal, reconnecting");
+                        if let Err(re) = self.config.reconnect_chain_client().await {
+                            warn!(error = ?re, "chain reconnect failed after weight reveal RPC disconnect");
+                        }
+                    }
                     warn!(error = ?e, "weight reveal failed, will retry next cycle");
                 }
             }
@@ -1762,6 +1768,12 @@ impl ValidatorLoop {
                     match self.update_weights().await {
                         Ok(()) => {}
                         Err(e) => {
+                            if sn2_chain::is_rpc_disconnect(&e) {
+                                warn!(error = ?e, "chain RPC disconnected during weight update, reconnecting");
+                                if let Err(re) = self.config.reconnect_chain_client().await {
+                                    warn!(error = ?re, "chain reconnect failed after weight update RPC disconnect");
+                                }
+                            }
                             warn!(error = ?e, "weight update failed, will retry next cycle");
                         }
                     }
@@ -1879,11 +1891,25 @@ impl ValidatorLoop {
             .chain_client
             .as_ref()
             .context("sync_metagraph requires chain_client")?;
-        self.config
-            .metagraph
-            .sync(chain_client)
-            .await
-            .context("metagraph sync")?;
+        let sync_result = self.config.metagraph.sync(chain_client).await;
+        if let Err(ref e) = sync_result {
+            if sn2_chain::is_rpc_disconnect(e) {
+                warn!(error = ?e, "chain RPC connection dead, reconnecting");
+                self.config.reconnect_chain_client().await?;
+                let chain_client = self
+                    .config
+                    .chain_client
+                    .as_ref()
+                    .context("chain_client missing after reconnect")?;
+                self.config
+                    .metagraph
+                    .sync(chain_client)
+                    .await
+                    .context("metagraph sync after reconnect")?;
+            } else {
+                sync_result.context("metagraph sync")?;
+            }
+        }
 
         let uids = self.config.metagraph.uids();
         self.score_manager.sync_uids(&uids);
@@ -1964,12 +1990,12 @@ impl ValidatorLoop {
             let mut client = self.miner_client.write().await;
             if let Err(e) = client
                 .lightning_mut()
-                .update_miner_registry(quic_miners)
+                .update_miner_registry(quic_miners.clone())
                 .await
             {
                 warn!(error = %e, "updating QUIC miner connections");
             }
-            client.clear_transport_cache();
+            client.seed_transport_cache(&quic_miners).await;
         } else {
             let client = self.miner_client.read().await;
             client.clear_transport_cache();

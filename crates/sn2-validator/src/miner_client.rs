@@ -234,20 +234,16 @@ impl MinerQueryClient {
                 Ok(result)
             }
             Err(e) if is_connection_error(&e) => {
-                if is_probe {
-                    self.set_transport(hotkey, TransportPreference::HttpOnly);
-                    warn!(
-                        hotkey = hotkey,
-                        error = %e,
-                        "QUIC probe failed, falling back to HTTP"
-                    );
-                    let headers = self.build_signing_headers(body, hotkey)?;
-                    self.query_miner_http(ip, port, synapse_type, body, &headers, timeout_secs)
-                        .await
-                } else {
-                    self.set_transport(hotkey, TransportPreference::Unknown);
-                    Err(e)
-                }
+                self.set_transport(hotkey, TransportPreference::HttpOnly);
+                warn!(
+                    hotkey = hotkey,
+                    error = ?e,
+                    probe = is_probe,
+                    "QUIC query failed, falling back to HTTP"
+                );
+                let headers = self.build_signing_headers(body, hotkey)?;
+                self.query_miner_http(ip, port, synapse_type, body, &headers, timeout_secs)
+                    .await
             }
             Err(e) => {
                 if is_probe {
@@ -286,6 +282,35 @@ impl MinerQueryClient {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
+    }
+
+    pub async fn seed_transport_cache(&self, miners: &[QuicAxonInfo]) {
+        let stats = match self.lightning.get_connection_stats().await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "failed to read connection stats for transport seeding");
+                self.clear_transport_cache();
+                return;
+            }
+        };
+        let mut cache = self
+            .transport_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        cache.clear();
+        let mut quic_count = 0u32;
+        for miner in miners {
+            let key = format!("connection_{}", miner.addr_key());
+            if stats.contains_key(&key) {
+                cache.insert(miner.hotkey.clone(), TransportPreference::Quic);
+                quic_count += 1;
+            }
+        }
+        info!(
+            quic = quic_count,
+            http_only = miners.len() as u32 - quic_count,
+            "seeded transport cache from QUIC connection state"
+        );
     }
 }
 
