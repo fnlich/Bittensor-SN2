@@ -12054,6 +12054,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tracing-subscriber 0.3.22",
 ]
 
 [[package]]

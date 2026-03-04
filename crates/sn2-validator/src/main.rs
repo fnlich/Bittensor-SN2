@@ -27,16 +27,7 @@ use crate::cli::Cli;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::try_new(&cli.log_level).unwrap_or_else(|e| {
-                    eprintln!("invalid --log-level \"{}\": {e}", cli.log_level);
-                    std::process::exit(1);
-                })
-            }),
-        )
-        .init();
+    sn2_types::init_tracing(&cli.log_level);
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
