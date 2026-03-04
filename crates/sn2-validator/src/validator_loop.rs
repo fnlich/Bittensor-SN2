@@ -1130,12 +1130,6 @@ impl ValidatorLoop {
     }
 
     fn get_queryable_neurons(&self) -> Vec<&sn2_chain::NeuronInfo> {
-        let stake_threshold = if self.config.is_testnet {
-            u64::MAX
-        } else {
-            VALIDATOR_STAKE_THRESHOLD
-        };
-
         self.config
             .metagraph
             .neurons
@@ -1144,7 +1138,7 @@ impl ValidatorLoop {
                 if let Some(targets) = &self.config.target_uids {
                     return targets.contains(&n.uid);
                 }
-                if n.stake >= stake_threshold {
+                if n.validator_permit {
                     return false;
                 }
                 if n.axon_ip.is_empty() || n.axon_port == 0 {
@@ -1981,17 +1975,24 @@ impl ValidatorLoop {
             self.uid_hotkeys.insert(neuron.uid, neuron.hotkey.clone());
         }
 
-        let active_count = self.config.metagraph.active_neurons().count();
+        let miner_count = self
+            .config
+            .metagraph
+            .neurons
+            .iter()
+            .filter(|n| !n.validator_permit)
+            .count();
         let axon_count = self
             .config
             .metagraph
-            .active_neurons()
-            .filter(|n| !n.axon_ip.is_empty() && n.axon_port > 0)
+            .neurons
+            .iter()
+            .filter(|n| !n.validator_permit && !n.axon_ip.is_empty() && n.axon_port > 0)
             .count();
         metrics::set_metagraph_n(self.config.metagraph.n);
         info!(
             n = self.config.metagraph.n,
-            active = active_count,
+            miners = miner_count,
             with_axon = axon_count,
             "metagraph synced"
         );
