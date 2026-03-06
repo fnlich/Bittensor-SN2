@@ -6,8 +6,8 @@ use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use jstprove_circuits::onnx::{
-    deserialize_circuit_bn254, flatten_circuit_bn254, verify_and_extract_bn254_with_flat,
-    FlatCircuitBN254,
+    deserialize_circuit_bn254, flatten_circuit_bn254,
+    verify_and_extract_bn254_with_flat_ref, FlatCircuitBN254,
 };
 use jstprove_circuits::runner::main_runner::read_circuit_msgpack;
 
@@ -122,12 +122,11 @@ pub async fn verify_inner(
 
     tokio::task::spawn_blocking(move || {
         let cached = get_or_load_flat(&circuit_path)?;
-        let mut circuit = (*cached).clone();
         let witness_bytes = hex::decode(witness_hex.trim()).context("hex-decoding witness")?;
         let proof_bytes = hex::decode(proof_hex.trim()).context("hex-decoding proof")?;
 
-        let result = verify_and_extract_bn254_with_flat(
-            &mut circuit,
+        let result = verify_and_extract_bn254_with_flat_ref(
+            &cached,
             &witness_bytes,
             &proof_bytes,
             num_inputs,
