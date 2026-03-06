@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::tensor_json::{arrayd_to_json, json_to_arrayd};
 use dsperse::pipeline::{IncrementalRun, SliceExecutionResult, SliceWork};
-use dsperse::schema::execution::ExecutionInfo;
+use dsperse::schema::execution::{ExecutionInfo, ExecutionMethod};
 use dsperse::schema::tiling::TilingInfo;
 use sn2_types::{ProofSystem, RunSource};
 use tracing::{info, warn};
@@ -305,7 +305,7 @@ impl IncrementalRunManager {
             slice_id: slice_id.to_string(),
             output: output_tensor,
             execution_info: ExecutionInfo {
-                method: "remote_miner".to_string(),
+                method: ExecutionMethod::JstproveGenWitness,
                 success: true,
                 error: None,
                 witness_file: None,
