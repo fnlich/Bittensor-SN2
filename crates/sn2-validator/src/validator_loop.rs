@@ -109,6 +109,7 @@ pub struct ValidatorLoop {
     dsperse_emit_tasks: JoinSet<()>,
     verify_tasks: JoinSet<VerifyResult>,
     verify_guard_hashes: HashMap<tokio::task::Id, Option<String>>,
+    pending_verifications: VecDeque<TaskResult>,
 }
 
 impl ValidatorLoop {
@@ -252,6 +253,7 @@ impl ValidatorLoop {
             dsperse_emit_tasks: JoinSet::new(),
             verify_tasks: JoinSet::new(),
             verify_guard_hashes: HashMap::new(),
+            pending_verifications: VecDeque::new(),
         })
     }
 
@@ -331,6 +333,7 @@ impl ValidatorLoop {
                             error!(error = %e, "verification task panicked");
                         }
                     }
+                    self.drain_pending_verifications();
                 }
                 Some(submission) = self.dsperse_rx.recv() => {
                     self.handle_dsperse_submission(submission).await;
@@ -1286,7 +1289,7 @@ impl ValidatorLoop {
             .collect()
     }
 
-    fn start_verification(&mut self, mut result: TaskResult) {
+    fn start_verification(&mut self, result: TaskResult) {
         let uid = result.uid;
 
         if let Some(count) = self.miner_active_count.get_mut(&uid) {
@@ -1296,6 +1299,24 @@ impl ValidatorLoop {
             self.benchmark_in_flight = self.benchmark_in_flight.saturating_sub(1);
         }
 
+        if self.verify_tasks.len() >= MAX_CONCURRENT_VERIFICATIONS {
+            self.pending_verifications.push_back(result);
+            return;
+        }
+
+        self.spawn_verification(result);
+    }
+
+    fn drain_pending_verifications(&mut self) {
+        while self.verify_tasks.len() < MAX_CONCURRENT_VERIFICATIONS {
+            match self.pending_verifications.pop_front() {
+                Some(result) => self.spawn_verification(result),
+                None => break,
+            }
+        }
+    }
+
+    fn spawn_verification(&mut self, mut result: TaskResult) {
         let guard_hash = result.guard_hash.clone();
         let handle = match result.outcome {
             TaskOutcome::Success(ref mut response) if response.proof_content.is_some() => {
