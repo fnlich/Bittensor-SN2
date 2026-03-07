@@ -40,6 +40,7 @@ impl CircuitStore {
             cache_dir: PathBuf::from(cache_dir),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
+                .user_agent(concat!("sn2-circuit-store/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .unwrap_or_default(),
             loopback,
@@ -360,25 +361,14 @@ impl CircuitStore {
                                 downloaded += 1;
                                 continue;
                             }
-                            let partial = dest.with_extension("dslice.partial");
-                            match download_file_static(&http, url, &partial).await {
+                            match download_file_static(&http, url, dest).await {
                                 Ok(()) => {
-                                    if let Err(e) = std::fs::rename(&partial, dest) {
-                                        warn!(
-                                            file = %dest.display(),
-                                            error = %e,
-                                            "failed to rename partial dslice download"
-                                        );
-                                        std::fs::remove_file(&partial).ok();
-                                        continue;
-                                    }
                                     downloaded += 1;
                                     if downloaded % 20 == 0 || downloaded == count {
                                         info!(progress = %format!("{downloaded}/{count}"), "dslice download progress");
                                     }
                                 }
                                 Err(e) => {
-                                    std::fs::remove_file(&partial).ok();
                                     warn!(file = %dest.display(), error = %e, "failed to download dslice file");
                                 }
                             }
