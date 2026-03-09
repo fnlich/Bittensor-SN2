@@ -314,6 +314,11 @@ impl CircuitStore {
             }
 
             let mut deferred_downloads: Vec<(String, PathBuf)> = Vec::new();
+            let checksums = data
+                .get("checksums")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
 
             for (filename, url_val) in files {
                 let skip = if is_dsperse {
@@ -329,7 +334,14 @@ impl CircuitStore {
                     let archive_dest = cache_path.join("slices").join(filename);
                     let slice_name = filename.trim_end_matches(".dslice");
                     let extracted_dir = cache_path.join("slices").join(slice_name);
-                    if archive_dest.exists() || extracted_dir.exists() {
+                    if archive_dest.exists() {
+                        if file_checksum_valid(&archive_dest, &checksums, filename) {
+                            continue;
+                        }
+                        warn!(file = %filename, "SHA-256 mismatch, removing corrupted dslice");
+                        std::fs::remove_file(&archive_dest).ok();
+                        std::fs::remove_dir_all(&extracted_dir).ok();
+                    } else if extracted_dir.exists() {
                         continue;
                     }
                     if let Some(url) = url_val.as_str() {
@@ -644,6 +656,32 @@ pub fn ensure_slice_extracted(slices_dir: &Path, slice_id: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn file_checksum_valid(
+    path: &Path,
+    checksums: &serde_json::Map<String, serde_json::Value>,
+    filename: &str,
+) -> bool {
+    let Some(expected) = checksums.get(filename).and_then(|v| v.as_str()) else {
+        return true;
+    };
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let Ok(n) = std::io::Read::read(&mut reader, &mut buf) else {
+            return false;
+        };
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    hex::encode(hasher.finalize()) == expected
 }
 
 pub fn cleanup_extracted_slice(slices_dir: &Path, slice_id: &str) {
