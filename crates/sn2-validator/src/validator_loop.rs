@@ -19,7 +19,9 @@ use crate::miner_client::MinerQueryClient;
 use crate::performance::PerformanceTracker;
 use crate::pow_manager::{PowItem, PowManager};
 use crate::proof_uploader::ProofUploader;
-use crate::relay::{DsperseSubmission, RelayManager, RwrSubmission};
+use crate::relay::{
+    DsperseSubmission, RelayManager, RwrSubmission, FRAME_PROOF_RESULT, FRAME_SUBMIT_RESULT,
+};
 use crate::request_pipeline::RequestPipeline;
 use crate::response_processor::ResponseProcessor;
 use crate::scoring::ScoreManager;
@@ -50,7 +52,7 @@ struct TaskResult {
     uid: u16,
     request_type: RequestType,
     guard_hash: Option<String>,
-    external_request_hash: Option<String>,
+    external_request_hash: Option<u32>,
     retry_count: u32,
     was_at_capacity: bool,
     slice_num: Option<String>,
@@ -102,7 +104,7 @@ impl PeriodicTimings {
 struct DispatchedRequest {
     request_type: RequestType,
     guard_hash: Option<String>,
-    external_request_hash: Option<String>,
+    external_request_hash: Option<u32>,
     body: serde_json::Value,
     synapse_name: &'static str,
     retry_count: u32,
@@ -431,9 +433,9 @@ impl ValidatorLoop {
         Ok(())
     }
 
-    async fn relay_send_response(&self, request_id: &str, result: serde_json::Value) {
+    async fn relay_send_response(&self, msg_type: u8, req_id: u32, result: serde_json::Value) {
         if let Some(relay) = &self.relay {
-            relay.send_response(request_id, result).await;
+            relay.send_response(msg_type, req_id, result).await;
         }
     }
 
@@ -490,8 +492,9 @@ impl ValidatorLoop {
             Ok(c) => c,
             Err(e) => {
                 warn!(circuit = %submission.circuit_id, error = %e, "unknown circuit in dsperse submission");
-                if let Some(req_id) = &submission.request_id {
+                if let Some(req_id) = submission.request_id {
                     self.relay_send_response(
+                        FRAME_SUBMIT_RESULT,
                         req_id,
                         serde_json::json!({"error": format!("unknown circuit: {e}")}),
                     )
@@ -501,32 +504,82 @@ impl ValidatorLoop {
             }
         };
 
-        if let Err(msg) = circuit.validate_inputs(&submission.inputs) {
-            warn!(circuit = %circuit.id, error = %msg, "invalid inputs for dsperse submission");
-            if let Some(req_id) = &submission.request_id {
-                self.relay_send_response(
-                    req_id,
-                    serde_json::json!({"error": format!("invalid input shape: {msg}")}),
-                )
-                .await;
+        if submission.tensor_data.is_none() {
+            if let Err(msg) = circuit.validate_inputs(&submission.inputs) {
+                warn!(circuit = %circuit.id, error = %msg, "invalid inputs for dsperse submission");
+                if let Some(req_id) = submission.request_id {
+                    self.relay_send_response(
+                        FRAME_SUBMIT_RESULT,
+                        req_id,
+                        serde_json::json!({"error": format!("invalid input shape: {msg}")}),
+                    )
+                    .await;
+                }
+                return;
             }
-            return;
         }
 
         let slices_dir = circuit.paths.base_path.join("slices");
-        let tensor_value = submission
-            .inputs
-            .get("input_data")
-            .unwrap_or(&submission.inputs);
-        let input_tensor = match crate::tensor_json::json_to_arrayd(tensor_value) {
-            Ok(t) => t,
-            Err(e) => {
-                warn!(error = %e, "failed to convert input to tensor");
-                if let Some(req_id) = &submission.request_id {
-                    self.relay_send_response(req_id, serde_json::json!({"error": e.to_string()}))
+        let input_tensor = if let Some(tensor_bytes) = &submission.tensor_data {
+            let shape: Vec<usize> = match circuit
+                .metadata
+                .input_schema
+                .as_ref()
+                .and_then(|s| s.get("shape"))
+                .and_then(|v| v.as_array())
+                .and_then(|dims| {
+                    dims.iter()
+                        .map(|d| d.as_u64().and_then(|n| usize::try_from(n).ok()))
+                        .collect::<Option<Vec<_>>>()
+                }) {
+                Some(s) => s,
+                None => {
+                    warn!(circuit = %circuit.id, "circuit schema missing valid shape for binary tensor");
+                    if let Some(req_id) = submission.request_id {
+                        self.relay_send_response(
+                            FRAME_SUBMIT_RESULT,
+                            req_id,
+                            serde_json::json!({"error": "circuit schema missing shape"}),
+                        )
                         .await;
+                    }
+                    return;
                 }
-                return;
+            };
+            match crate::tensor::decode_gzipped_protobuf_tensor(tensor_bytes, &shape) {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(error = %e, "failed to decode binary tensor");
+                    if let Some(req_id) = submission.request_id {
+                        self.relay_send_response(
+                            FRAME_SUBMIT_RESULT,
+                            req_id,
+                            serde_json::json!({"error": e.to_string()}),
+                        )
+                        .await;
+                    }
+                    return;
+                }
+            }
+        } else {
+            let tensor_value = submission
+                .inputs
+                .get("input_data")
+                .unwrap_or(&submission.inputs);
+            match crate::tensor::json_to_arrayd(tensor_value) {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(error = %e, "failed to convert input to tensor");
+                    if let Some(req_id) = submission.request_id {
+                        self.relay_send_response(
+                            FRAME_SUBMIT_RESULT,
+                            req_id,
+                            serde_json::json!({"error": e.to_string()}),
+                        )
+                        .await;
+                    }
+                    return;
+                }
             }
         };
 
@@ -534,9 +587,13 @@ impl ValidatorLoop {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, circuit = %circuit.id, "failed to create IncrementalRun");
-                if let Some(req_id) = &submission.request_id {
-                    self.relay_send_response(req_id, serde_json::json!({"error": e.to_string()}))
-                        .await;
+                if let Some(req_id) = submission.request_id {
+                    self.relay_send_response(
+                        FRAME_SUBMIT_RESULT,
+                        req_id,
+                        serde_json::json!({"error": e.to_string()}),
+                    )
+                    .await;
                 }
                 return;
             }
@@ -550,7 +607,7 @@ impl ValidatorLoop {
             circuit.id.clone(),
             circuit.metadata.name.clone(),
             RunSource::Api,
-            submission.request_id.clone(),
+            submission.request_id,
             Some(incremental),
         );
 
@@ -568,8 +625,9 @@ impl ValidatorLoop {
 
         self.relay_register_pending(&run_uid).await;
 
-        if let Some(req_id) = &submission.request_id {
+        if let Some(req_id) = submission.request_id {
             self.relay_send_response(
+                FRAME_SUBMIT_RESULT,
                 req_id,
                 serde_json::json!({
                     "run_uid": run_uid,
@@ -825,7 +883,7 @@ impl ValidatorLoop {
             if input_max_abs > 1.0 {
                 slice_info.input_tensor.mapv_inplace(|v| v / input_max_abs);
                 slice_info.inputs_json = serde_json::json!({
-                    "input_data": crate::tensor_json::arrayd_to_json(&slice_info.input_tensor)
+                    "input_data": crate::tensor::arrayd_to_json(&slice_info.input_tensor)
                 });
                 self.dslice_input_scales.insert(
                     (run_uid.to_string(), slice_info.slice_id.clone()),
@@ -894,7 +952,7 @@ impl ValidatorLoop {
 
                 for (idx, tile) in tiles.into_iter().enumerate() {
                     let tile_json = serde_json::json!({
-                        "input_data": crate::tensor_json::arrayd_to_json(&tile.into_dyn())
+                        "input_data": crate::tensor::arrayd_to_json(&tile.into_dyn())
                     });
                     let request = DSliceRequest {
                         circuit: circuit.clone(),
@@ -1170,8 +1228,9 @@ impl ValidatorLoop {
                 Ok(c) => c,
                 Err(e) => {
                     warn!(circuit = %rwr.circuit_id, error = %e, "unknown circuit for RWR");
-                    if let Some(req_id) = &rwr.request_id {
+                    if let Some(req_id) = rwr.request_id {
                         self.relay_send_response(
+                            FRAME_PROOF_RESULT,
                             req_id,
                             serde_json::json!({"success": false, "error": format!("unknown circuit: {e}")}),
                         ).await;
@@ -1181,8 +1240,9 @@ impl ValidatorLoop {
             };
             if let Err(msg) = circuit.validate_inputs(&rwr.inputs) {
                 warn!(circuit = %rwr.circuit_id, error = %msg, "invalid inputs for RWR");
-                if let Some(req_id) = &rwr.request_id {
+                if let Some(req_id) = rwr.request_id {
                     self.relay_send_response(
+                        FRAME_PROOF_RESULT,
                         req_id,
                         serde_json::json!({"success": false, "error": format!("invalid input shape: {msg}")}),
                     )
@@ -1202,7 +1262,7 @@ impl ValidatorLoop {
             return Some(DispatchedRequest {
                 request_type: RequestType::Rwr,
                 guard_hash,
-                external_request_hash: rwr.request_id.clone(),
+                external_request_hash: rwr.request_id,
                 body,
                 synapse_name: QueryZkProof::NAME,
                 retry_count: rwr.retry_count,
@@ -1382,7 +1442,9 @@ impl ValidatorLoop {
                     let mut response = MinerResponse {
                         uid,
                         verification_result: false,
-                        external_request_hash: external_request_hash.clone().unwrap_or_default(),
+                        external_request_hash: external_request_hash
+                            .map(|id| id.to_string())
+                            .unwrap_or_default(),
                         response_time: elapsed,
                         proof_size: 0,
                         circuit: task_circuit,
@@ -1436,7 +1498,7 @@ impl ValidatorLoop {
                 uid,
                 request_type,
                 guard_hash: guard_hash.clone(),
-                external_request_hash: external_request_hash.clone(),
+                external_request_hash,
                 retry_count,
                 was_at_capacity,
                 slice_num,
@@ -1579,7 +1641,7 @@ impl ValidatorLoop {
         let is_tile = result.is_tile;
         let task_id = result.task_id.clone();
         let tile_idx = result.tile_idx;
-        let external_request_hash = result.external_request_hash.clone();
+        let external_request_hash = result.external_request_hash;
         let retry_count = result.retry_count;
         let mut result = result;
         let retry_payload = std::mem::replace(&mut result.retry_payload, RetryPayload::None);
@@ -1653,8 +1715,9 @@ impl ValidatorLoop {
                             .await;
                         }
 
-                        if let Some(req_id) = &external_request_hash {
+                        if let Some(req_id) = external_request_hash {
                             self.relay_send_response(
+                                FRAME_PROOF_RESULT,
                                 req_id,
                                 serde_json::json!({
                                     "success": true,
@@ -1701,7 +1764,7 @@ impl ValidatorLoop {
                 is_tile,
                 task_id.as_deref(),
                 tile_idx,
-                external_request_hash.as_deref(),
+                external_request_hash,
                 &reason,
             )
             .await;
@@ -1823,7 +1886,7 @@ impl ValidatorLoop {
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
 
-            let tile_output = match crate::tensor_json::json_to_arrayd(&computed) {
+            let tile_output = match crate::tensor::json_to_arrayd(&computed) {
                 Ok(t) => t,
                 Err(e) => {
                     warn!(
@@ -1880,7 +1943,7 @@ impl ValidatorLoop {
         let scale_key = (run_uid.clone(), slice_num.clone());
         let scale = self.dslice_input_scales.remove(&scale_key);
 
-        let mut tensor = match crate::tensor_json::json_to_arrayd(&computed) {
+        let mut tensor = match crate::tensor::json_to_arrayd(&computed) {
             Ok(t) => t,
             Err(e) => {
                 warn!(run_uid = %run_uid, slice = %slice_num, error = %e, "output tensor conversion failed, removing run");
@@ -2122,7 +2185,7 @@ impl ValidatorLoop {
         is_tile: bool,
         _task_id: Option<&str>,
         tile_idx: Option<u32>,
-        external_request_hash: Option<&str>,
+        external_request_hash: Option<u32>,
         reason: &str,
     ) {
         warn!(uid = uid, rtype = %request_type, retry = retry_count, error = reason, "miner query failed");
@@ -2190,7 +2253,12 @@ impl ValidatorLoop {
         }
 
         if let Some(req_id) = external_request_hash {
+            let frame_type = match request_type {
+                RequestType::Rwr | RequestType::ProofOfWeights => FRAME_PROOF_RESULT,
+                _ => FRAME_SUBMIT_RESULT,
+            };
             self.relay_send_response(
+                frame_type,
                 req_id,
                 serde_json::json!({
                     "success": false,
