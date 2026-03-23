@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::stats_reporter::collect_environment;
+use crate::stats_reporter::{collect_environment, post_with_backoff};
 use base64::Engine;
 use sn2_chain::Wallet;
 use sn2_types::DEFAULT_API_URL;
@@ -107,27 +107,10 @@ impl DsperseEventClient {
         let url = format!("{}/statistics/dsperse/events/", self.api_url);
         let count = events.len();
 
-        match self
-            .http
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("X-Request-Signature", &sig)
-            .body(body_bytes)
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                debug!(count, "flushed dsperse events");
-            }
-            Ok(resp) => {
-                let status = resp.status();
-                warn!(%status, count, "dsperse events POST rejected");
-                self.restore_buffer(events).await;
-            }
-            Err(e) => {
-                warn!(error = %e, count, "dsperse events POST failed");
-                self.restore_buffer(events).await;
-            }
+        if post_with_backoff(&self.http, &url, &body_bytes, &sig, "dsperse/events").await {
+            debug!(count, "flushed dsperse events");
+        } else {
+            self.restore_buffer(events).await;
         }
     }
 
