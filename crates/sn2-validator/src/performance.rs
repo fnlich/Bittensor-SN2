@@ -7,7 +7,7 @@ use sn2_types::{
     CIRCUIT_TIMEOUT_SECONDS, PERFORMANCE_MIN_SAMPLES, PERFORMANCE_RESCHEDULE_PENALTY,
     PERFORMANCE_SCORING_PERCENTILE, PERFORMANCE_WINDOW_SIZE,
 };
-use tracing::{info, warn};
+use tracing::warn;
 
 pub struct PerformanceTracker {
     windows: HashMap<u16, VecDeque<(bool, f64)>>,
@@ -19,15 +19,13 @@ pub struct PerformanceTracker {
 
 impl PerformanceTracker {
     pub fn new_with_persistence(path: PathBuf) -> Self {
-        let mut tracker = Self {
+        Self {
             windows: HashMap::new(),
             adaptive_caps: HashMap::new(),
             at_cap_results: HashMap::new(),
             window_size: PERFORMANCE_WINDOW_SIZE,
             persistence_path: Some(path),
-        };
-        tracker.load();
-        tracker
+        }
     }
 
     pub fn record(&mut self, uid: u16, success: bool, response_time: f64, was_at_capacity: bool) {
@@ -129,79 +127,6 @@ impl PerformanceTracker {
                 warn!(error = %e, "serializing performance tracker");
             }
         }
-    }
-
-    fn load(&mut self) {
-        let path = match &self.persistence_path {
-            Some(p) => p,
-            None => return,
-        };
-
-        let data = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-
-        let json: serde_json::Value = match serde_json::from_str(&data) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, "parsing performance tracker file");
-                return;
-            }
-        };
-
-        if let Some(windows) = json.get("windows").and_then(|v| v.as_object()) {
-            for (uid_str, entries) in windows {
-                let uid: u16 = match uid_str.parse() {
-                    Ok(u) => u,
-                    Err(_) => continue,
-                };
-                if let Some(arr) = entries.as_array() {
-                    let mut window = VecDeque::new();
-                    for entry in arr {
-                        if let Some(pair) = entry.as_array() {
-                            if pair.len() == 2 {
-                                let success = pair[0].as_bool().unwrap_or(false);
-                                let time = pair[1].as_f64().unwrap_or(0.0);
-                                window.push_back((success, time));
-                            }
-                        }
-                    }
-                    if !window.is_empty() {
-                        self.windows.insert(uid, window);
-                    }
-                }
-            }
-        }
-
-        if let Some(capacities) = json.get("capacities").and_then(|v| v.as_object()) {
-            for (uid_str, cap_data) in capacities {
-                let uid: u16 = match uid_str.parse() {
-                    Ok(u) => u,
-                    Err(_) => continue,
-                };
-                if let Some(arr) = cap_data.as_array() {
-                    if let Some(cap) = arr.first().and_then(|v| v.as_u64()) {
-                        self.adaptive_caps.insert(uid, cap as usize);
-                    }
-                    if let Some(results) = arr.get(1).and_then(|v| v.as_array()) {
-                        let mut deque = VecDeque::new();
-                        for r in results {
-                            deque.push_back(r.as_bool().unwrap_or(false));
-                        }
-                        if !deque.is_empty() {
-                            self.at_cap_results.insert(uid, deque);
-                        }
-                    }
-                }
-            }
-        }
-
-        info!(
-            windows = self.windows.len(),
-            capacities = self.adaptive_caps.len(),
-            "loaded performance tracker state"
-        );
     }
 
     pub fn snapshot(&self) -> HashMap<u16, (f64, usize)> {
