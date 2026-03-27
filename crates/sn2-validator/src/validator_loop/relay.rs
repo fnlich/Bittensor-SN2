@@ -124,17 +124,18 @@ impl ValidatorLoop {
         &mut self,
         run_uid: &str,
         active_run: &Option<crate::incremental_runner::ActiveRun>,
+        final_output: Option<serde_json::Value>,
     ) {
         let notify_circuit_id = active_run
             .as_ref()
             .map(|r| r.circuit_id.as_str())
             .unwrap_or_default()
             .to_string();
-        self.relay_set_request_result(
-            run_uid,
-            serde_json::json!({"run_uid": run_uid, "status": "complete"}),
-        )
-        .await;
+        let mut result = serde_json::json!({"run_uid": run_uid, "status": "complete"});
+        if let Some(output) = final_output {
+            result["output"] = output;
+        }
+        self.relay_set_request_result(run_uid, result).await;
         self.relay_send_notification(
             "subnet-2.batch_completed",
             serde_json::json!({
@@ -154,10 +155,7 @@ impl ValidatorLoop {
 
         let total_run_time_sec = run.started_at.elapsed().as_secs_f64();
         let mut failed_count = 0usize;
-        let model_slices = run
-            .incremental
-            .as_ref()
-            .map(|i| i.model_meta().slices.clone());
+        let model_slices = run.combined.as_ref().map(|c| c.model_meta().slices.clone());
         let slice_reports: Vec<DsperseSliceReport> = run
             .artifacts
             .iter()
@@ -194,9 +192,9 @@ impl ValidatorLoop {
         let all_successful = failed_count == 0 && !slice_reports.is_empty();
 
         let total_slices = run
-            .incremental
+            .combined
             .as_ref()
-            .map(|i| i.model_meta().slices.len())
+            .map(|c| c.model_meta().slices.len())
             .unwrap_or(slice_reports.len());
 
         reporter.report_dsperse_run(DsperseRunReport {
@@ -227,7 +225,7 @@ impl ValidatorLoop {
     }
 
     pub(super) async fn teardown_run(&mut self, run_uid: &str) {
-        self.cleanup_previous_slice(run_uid);
+        self.cleanup_extracted_slices(run_uid).await;
         let removed = self.run_manager.remove_run(run_uid);
         if let Some(ref run) = removed {
             self.spawn_emit_run_complete(run, false);

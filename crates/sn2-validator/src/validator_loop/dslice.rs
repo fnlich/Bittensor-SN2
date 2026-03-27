@@ -1,11 +1,34 @@
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use sn2_types::*;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use super::ValidatorLoop;
 use crate::relay::DsperseSubmission;
+
+struct StagedWork {
+    requests: VecDeque<DSliceRequest>,
+    events: Vec<(String, String, usize)>,
+}
+
+impl StagedWork {
+    fn new() -> Self {
+        Self {
+            requests: VecDeque::new(),
+            events: Vec::new(),
+        }
+    }
+
+    fn stage_request(&mut self, request: DSliceRequest) {
+        self.requests.push_back(request);
+    }
+
+    fn total_queued(&self) -> usize {
+        self.requests.len()
+    }
+}
 
 impl ValidatorLoop {
     pub(super) fn decode_submission_tensor(
@@ -73,21 +96,29 @@ impl ValidatorLoop {
             }
         };
 
-        let incremental = match dsperse::pipeline::IncrementalRun::new(&slices_dir, input_tensor) {
-            Ok(r) => r,
+        let dir = slices_dir.clone();
+        let combined = match tokio::task::spawn_blocking(move || {
+            dsperse::pipeline::CombinedRun::new(&dir, input_tensor)
+        })
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                warn!(error = %e, circuit = %circuit.id, "combined inference failed");
+                self.send_submit_error(submission.request_id, "combined inference failed")
+                    .await;
+                return;
+            }
             Err(e) => {
-                warn!(error = %e, circuit = %circuit.id, "failed to create IncrementalRun");
-                self.send_submit_error(
-                    submission.request_id,
-                    "failed to initialize incremental run",
-                )
-                .await;
+                warn!(error = %e, circuit = %circuit.id, "combined inference task panicked");
+                self.send_submit_error(submission.request_id, "combined inference panicked")
+                    .await;
                 return;
             }
         };
 
         let run_uid = uuid::Uuid::new_v4().to_string();
-        info!(run_uid = %run_uid, circuit = %circuit.id, "started incremental run");
+        info!(run_uid = %run_uid, circuit = %circuit.id, "started combined run");
 
         self.run_manager.start_run(
             run_uid.clone(),
@@ -95,7 +126,7 @@ impl ValidatorLoop {
             circuit.metadata.name.clone(),
             RunSource::Api,
             submission.request_id,
-            Some(incremental),
+            Some(combined),
         );
 
         let (total_slices, total_tiles, stc) = self.run_manager.slice_tile_counts(&run_uid);
@@ -135,432 +166,245 @@ impl ValidatorLoop {
         self.stacked_dslice_queue.clear();
         self.dsperse_benchmark_backoff_until = Instant::now() + Duration::from_secs(120);
 
-        self.enqueue_next_dslice(&run_uid, &circuit).await;
+        self.enqueue_all_dslices(&run_uid, &circuit, RunSource::Api)
+            .await;
     }
 
-    pub(super) fn cleanup_previous_slice(&mut self, run_uid: &str) {
-        if let Some((prev_dir, prev_id)) = self.active_extracted_slices.remove(run_uid) {
-            let slice_path = prev_dir.join(&prev_id);
-            sn2_verify::evict_circuit_cache(&slice_path.to_string_lossy());
-            sn2_circuit_store::cleanup_extracted_slice(&prev_dir, &prev_id);
+    pub(super) async fn cleanup_extracted_slices(&mut self, run_uid: &str) {
+        if let Some(slices) = self.active_extracted_slices.remove(run_uid) {
+            let uid = run_uid.to_string();
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                for (dir, sid) in slices {
+                    let slice_path = dir.join(&sid);
+                    sn2_verify::evict_circuit_cache(&slice_path.to_string_lossy());
+                    sn2_circuit_store::cleanup_extracted_slice(&dir, &sid);
+                }
+                tracing::debug!(run_uid = %uid, "extracted slices cleaned up");
+            })
+            .await
+            {
+                warn!(run_uid = %run_uid, error = %e, "slice cleanup task failed");
+            }
         }
     }
 
-    pub(super) async fn enqueue_next_dslice(&mut self, run_uid: &str, circuit: &Circuit) {
-        let slices_dir = circuit.paths.base_path.join("slices");
-        loop {
-            self.cleanup_previous_slice(run_uid);
-
-            let mut slice_info = match self.run_manager.next_slice(run_uid) {
-                Ok(Some(info)) => info,
-                Ok(None) => {
-                    debug!(run_uid = %run_uid, "no next slice available");
-                    return;
-                }
-                Err(e) => {
-                    warn!(run_uid = %run_uid, error = %e, "next_slice failed");
-                    return;
-                }
-            };
-
-            {
-                let dir = slices_dir.clone();
-                let sid = slice_info.slice_id.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    sn2_circuit_store::ensure_slice_extracted(&dir, &sid)
-                })
-                .await;
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        warn!(run_uid = %run_uid, slice = %slice_info.slice_id, error = %e, "failed to extract dslice");
-                        self.teardown_run(run_uid).await;
-                        return;
-                    }
-                    Err(e) => {
-                        warn!(run_uid = %run_uid, slice = %slice_info.slice_id, error = %e, "dslice extraction task panicked");
-                        self.teardown_run(run_uid).await;
-                        return;
-                    }
-                }
-            }
-
-            if !slice_info.use_circuit {
-                let onnx_path = match slice_info.onnx_path {
-                    Some(ref p) => p.clone(),
-                    None => {
-                        warn!(run_uid = %run_uid, slice = %slice_info.slice_id, "non-circuit slice has no onnx_path");
-                        self.teardown_run(run_uid).await;
-                        return;
-                    }
-                };
-                for (name, arr) in &slice_info.named_inputs {
-                    let nan_c = arr.iter().filter(|v| v.is_nan()).count();
-                    let inf_c = arr.iter().filter(|v| v.is_infinite()).count();
-                    let max_abs = arr.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-                    let f32_overflow = arr.iter().filter(|&&v| v.abs() > f32::MAX as f64).count();
-                    let elems = arr.len();
-                    info!(
-                        run_uid = %run_uid,
-                        slice = %slice_info.slice_id,
-                        input_name = %name,
-                        shape = ?arr.shape(),
-                        elems = elems,
-                        nan = nan_c,
-                        inf = inf_c,
-                        max_abs = max_abs,
-                        f32_overflow = f32_overflow,
-                        "ONNX slice input tensor stats"
-                    );
-                }
-                let output_tensor = match Self::run_onnx_slice_inference(
-                    run_uid,
-                    &slice_info.slice_id,
-                    &onnx_path,
-                    &slice_info.named_inputs,
-                    &slice_info.input_tensor,
-                )
-                .await
-                {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warn!(run_uid = %run_uid, slice = %slice_info.slice_id, error = %e, "ONNX slice inference failed");
-                        self.teardown_run(run_uid).await;
-                        return;
-                    }
-                };
-                match self.run_manager.apply_result_tensor(
-                    run_uid,
-                    &slice_info.slice_id,
-                    output_tensor,
-                ) {
-                    Ok(true) => {
-                        sn2_circuit_store::cleanup_extracted_slice(
-                            &slices_dir,
-                            &slice_info.slice_id,
-                        );
-                        info!(run_uid = %run_uid, "incremental run complete after ONNX slice");
-                        let active_run = self.run_manager.remove_run(run_uid);
-                        if let Some(ref run) = active_run {
-                            self.report_dsperse_completion(run);
-
-                            self.spawn_emit_run_complete(run, true);
-                        }
-                        let notify_circuit_id = active_run
-                            .as_ref()
-                            .map(|r| r.circuit_id.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        self.relay_set_request_result(
-                            run_uid,
-                            serde_json::json!({"run_uid": run_uid, "status": "complete"}),
-                        )
-                        .await;
-                        self.relay_send_notification(
-                            "subnet-2.batch_completed",
-                            serde_json::json!({
-                                "run_uid": run_uid,
-                                "circuit_id": notify_circuit_id,
-                                "status": "completed",
-                            }),
-                        )
-                        .await;
-                        return;
-                    }
-                    Ok(false) => {
-                        sn2_circuit_store::cleanup_extracted_slice(
-                            &slices_dir,
-                            &slice_info.slice_id,
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        sn2_circuit_store::cleanup_extracted_slice(
-                            &slices_dir,
-                            &slice_info.slice_id,
-                        );
-                        warn!(run_uid = %run_uid, error = %e, "apply_result failed for ONNX slice");
-                        self.teardown_run(run_uid).await;
-                        return;
-                    }
-                }
-            }
-
-            self.active_extracted_slices.insert(
-                run_uid.to_string(),
-                (slices_dir.clone(), slice_info.slice_id.clone()),
+    fn normalize_tensor(
+        &mut self,
+        run_uid: &str,
+        slice_id: &str,
+        input_tensor: &mut ndarray::ArrayD<f64>,
+    ) {
+        let input_max_abs = input_tensor.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        if input_max_abs > 1.0 {
+            input_tensor.mapv_inplace(|v| v / input_max_abs);
+            self.dslice_input_scales
+                .insert((run_uid.to_string(), slice_id.to_string()), input_max_abs);
+            info!(
+                run_uid = %run_uid,
+                slice = %slice_id,
+                input_max_abs,
+                "normalized circuit slice inputs to [-1, 1]"
             );
+        }
+    }
 
-            let run_source = self
-                .run_manager
-                .get_run_source(run_uid)
-                .unwrap_or(RunSource::Benchmark);
+    async fn extract_slice(
+        run_uid: &str,
+        slices_dir: &std::path::Path,
+        slice_id: &str,
+    ) -> Result<()> {
+        let dir = slices_dir.to_path_buf();
+        let sid = slice_id.to_string();
+        match tokio::task::spawn_blocking(move || {
+            sn2_circuit_store::ensure_slice_extracted(&dir, &sid)
+        })
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                warn!(run_uid = %run_uid, slice = %slice_id, error = %e, "failed to extract slice");
+                Err(e)
+            }
+            Err(e) => {
+                warn!(run_uid = %run_uid, slice = %slice_id, error = %e, "slice extraction panicked");
+                Err(anyhow::anyhow!(e))
+            }
+        }
+    }
 
-            if slice_info.input_tensor.iter().any(|v| !v.is_finite()) {
+    fn flush_staged(&mut self, staged: StagedWork) {
+        for request in staged.requests {
+            match request.run_source {
+                RunSource::Api => self.api_dslice_queue.push_back(request),
+                RunSource::Benchmark => self.stacked_dslice_queue.push_back(request),
+            }
+        }
+
+        for (uid, snum, count) in staged.events {
+            self.emit_event(move |ev| async move {
+                ev.emit_work_items_created(&uid, &snum, count).await;
+            });
+        }
+
+        self.dispatch_notify.notify_one();
+    }
+
+    pub(super) async fn enqueue_all_dslices(
+        &mut self,
+        run_uid: &str,
+        circuit: &Circuit,
+        run_source: RunSource,
+    ) {
+        let slices_dir = circuit.paths.base_path.join("slices");
+
+        let work_items = match self.run_manager.all_circuit_work(run_uid) {
+            Ok(items) => items,
+            Err(e) => {
+                warn!(run_uid = %run_uid, error = %e, "failed to enumerate circuit work");
+                self.teardown_run(run_uid).await;
+                return;
+            }
+        };
+
+        if work_items.is_empty() {
+            info!(run_uid = %run_uid, "no circuit slices to dispatch, completing run");
+            self.finalize_combined_run(run_uid).await;
+            return;
+        }
+
+        self.active_extracted_slices
+            .insert(run_uid.to_string(), Vec::new());
+        let mut staged = StagedWork::new();
+
+        for work in work_items {
+            if Self::extract_slice(run_uid, &slices_dir, &work.slice_id)
+                .await
+                .is_err()
+            {
+                self.teardown_run(run_uid).await;
+                return;
+            }
+            if let Some(slices) = self.active_extracted_slices.get_mut(run_uid) {
+                slices.push((slices_dir.clone(), work.slice_id.clone()));
+            }
+
+            let mut input_tensor = work.input;
+
+            if input_tensor.iter().any(|v| !v.is_finite()) {
                 warn!(
                     run_uid = %run_uid,
-                    slice = %slice_info.slice_id,
+                    slice = %work.slice_id,
                     "circuit slice input contains non-finite values, aborting run"
                 );
                 self.teardown_run(run_uid).await;
                 return;
             }
 
-            let input_max_abs = slice_info
-                .input_tensor
-                .iter()
-                .fold(0.0_f64, |m, v| m.max(v.abs()));
-            if input_max_abs > 1.0 {
-                slice_info.input_tensor.mapv_inplace(|v| v / input_max_abs);
-                slice_info.inputs_json = serde_json::json!({
-                    "input_data": crate::tensor::arrayd_to_json(&slice_info.input_tensor)
-                });
-                self.dslice_input_scales.insert(
-                    (run_uid.to_string(), slice_info.slice_id.clone()),
-                    input_max_abs,
-                );
-                info!(
-                    run_uid = %run_uid,
-                    slice = %slice_info.slice_id,
-                    input_max_abs,
-                    "normalized circuit slice inputs to [-1, 1]"
-                );
-            }
+            self.normalize_tensor(run_uid, &work.slice_id, &mut input_tensor);
 
-            if let Some(ref tiling) = slice_info.tiling {
-                let input_4d = match slice_info
-                    .input_tensor
-                    .into_dimensionality::<ndarray::Ix4>()
-                {
-                    Ok(arr) => arr,
-                    Err(e) => {
-                        warn!(
-                            run_uid = %run_uid,
-                            slice = %slice_info.slice_id,
-                            error = %e,
-                            "tiled slice requires 4D input"
-                        );
-                        self.teardown_run(run_uid).await;
-                        return;
-                    }
-                };
-                let tiles = match dsperse::pipeline::split_into_tiles(&input_4d, tiling) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warn!(
-                            run_uid = %run_uid,
-                            slice = %slice_info.slice_id,
-                            error = %e,
-                            "split_into_tiles failed"
-                        );
-                        self.teardown_run(run_uid).await;
-                        return;
-                    }
-                };
-
-                self.dispatch_tiled_slice(
+            let queued = if let Some(ref tiling) = work.tiling {
+                match Self::stage_tiled_work(
+                    &mut staged,
+                    &mut self.run_manager,
                     run_uid,
                     circuit,
-                    &slice_info.slice_id,
-                    slice_info.circuit_path.as_deref(),
+                    &work.slice_id,
+                    work.circuit_path.as_deref(),
                     tiling,
-                    tiles,
+                    input_tensor,
                     run_source,
-                )
-                .await;
-                return;
-            }
-
-            let request = DSliceRequest {
-                circuit: circuit.clone(),
-                inputs: slice_info.inputs_json,
-                request_type: RequestType::DSlice,
-                proof_system: circuit.proof_system,
-                slice_num: slice_info.slice_id.clone(),
-                run_uid: run_uid.to_string(),
-                outputs: None,
-                is_tile: false,
-                tile_idx: None,
-                task_id: None,
-                run_source,
-                retry_count: 0,
-                circuit_path: slice_info.circuit_path.clone(),
+                ) {
+                    Some(n) => n,
+                    None => {
+                        self.teardown_run(run_uid).await;
+                        return;
+                    }
+                }
+            } else {
+                let inputs_json = serde_json::json!({
+                    "input_data": crate::tensor::arrayd_to_json(&input_tensor)
+                });
+                staged.stage_request(DSliceRequest {
+                    circuit: circuit.clone(),
+                    inputs: inputs_json,
+                    request_type: RequestType::DSlice,
+                    proof_system: circuit.proof_system,
+                    slice_num: work.slice_id.clone(),
+                    run_uid: run_uid.to_string(),
+                    outputs: None,
+                    is_tile: false,
+                    tile_idx: None,
+                    task_id: None,
+                    run_source,
+                    retry_count: 0,
+                    circuit_path: work.circuit_path.clone(),
+                });
+                1
             };
-            match request.run_source {
-                RunSource::Api => self.api_dslice_queue.push_back(request),
-                RunSource::Benchmark => self.stacked_dslice_queue.push_back(request),
-            };
-            return;
-        }
-    }
 
-    pub(super) async fn run_onnx_slice_inference(
-        run_uid: &str,
-        slice_id: &str,
-        onnx_path: &str,
-        named_inputs: &[(String, ndarray::ArrayD<f64>)],
-        input_tensor: &ndarray::ArrayD<f64>,
-    ) -> Result<ndarray::ArrayD<f64>> {
-        let inference_result = if named_inputs.len() > 1 {
-            let inputs: Vec<(String, Vec<f64>, Vec<usize>)> = named_inputs
-                .iter()
-                .map(|(name, arr)| {
-                    (
-                        name.clone(),
-                        arr.iter().copied().collect(),
-                        arr.shape().to_vec(),
-                    )
-                })
-                .collect();
-            let onnx = onnx_path.to_string();
-            tokio::task::spawn_blocking(move || {
-                let refs: Vec<(&str, Vec<f64>, Vec<usize>)> = inputs
-                    .iter()
-                    .map(|(n, d, s)| (n.as_str(), d.clone(), s.clone()))
-                    .collect();
-                dsperse::backend::onnx::run_inference_multi(std::path::Path::new(&onnx), &refs)
-            })
-            .await
-        } else {
-            let input_flat: Vec<f64> = input_tensor.iter().copied().collect();
-            let input_shape: Vec<usize> = input_tensor.shape().to_vec();
-            let onnx = onnx_path.to_string();
-            tokio::task::spawn_blocking(move || {
-                dsperse::backend::onnx::run_inference(
-                    std::path::Path::new(&onnx),
-                    &input_flat,
-                    &input_shape,
-                )
-            })
-            .await
-        };
-        let (output_data, output_shape) = match inference_result {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                return Err(anyhow::anyhow!("ONNX inference failed: {e}"));
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!("ONNX inference task panicked: {e}"));
-            }
-        };
-        let output_tensor =
-            ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&output_shape), output_data).map_err(
-                |e| anyhow::anyhow!("ONNX output shape mismatch (shape={output_shape:?}): {e}"),
-            )?;
-        let nan_count = output_tensor.iter().filter(|v| v.is_nan()).count();
-        let inf_count = output_tensor.iter().filter(|v| v.is_infinite()).count();
-        let total_elems = output_tensor.len();
-        if nan_count > 0 || inf_count > 0 {
-            warn!(
-                run_uid = %run_uid,
-                slice = %slice_id,
-                output_shape = ?output_tensor.shape(),
-                nan_count = nan_count,
-                inf_count = inf_count,
-                total_elems = total_elems,
-                "ONNX output contains non-finite values"
-            );
-            anyhow::bail!(
-                "ONNX output contains non-finite values (nan={nan_count}, inf={inf_count}, total={total_elems})"
-            );
+            staged
+                .events
+                .push((run_uid.to_string(), work.slice_id.clone(), queued));
         }
+
+        let total_queued = staged.total_queued();
+        self.flush_staged(staged);
+
         info!(
             run_uid = %run_uid,
-            slice = %slice_id,
-            output_shape = ?output_tensor.shape(),
-            total_elems = total_elems,
-            "ran ONNX inference for non-circuit slice"
+            total_queued,
+            "queued all circuit work items for combined run"
         );
-        Ok(output_tensor)
     }
 
-    pub(super) async fn dispatch_tiled_slice(
-        &mut self,
+    fn stage_tiled_work(
+        staged: &mut StagedWork,
+        run_manager: &mut crate::incremental_runner::IncrementalRunManager,
         run_uid: &str,
         circuit: &Circuit,
         slice_id: &str,
         circuit_path: Option<&str>,
         tiling: &dsperse::schema::tiling::TilingInfo,
-        tiles: Vec<ndarray::Array4<f64>>,
+        input_tensor: ndarray::ArrayD<f64>,
         run_source: RunSource,
-    ) {
-        let num_tiles = tiles.len();
-
-        if num_tiles == 0 {
-            warn!(
-                run_uid = %run_uid,
-                slice = %slice_id,
-                "split_into_tiles returned no tiles"
-            );
-            self.teardown_run(run_uid).await;
-            return;
-        }
-
-        if run_source == RunSource::Api {
-            info!(
-                run_uid = %run_uid,
-                slice = %slice_id,
-                num_tiles,
-                "API request: dispatching single tile for proven inference"
-            );
-            let tile = &tiles[0];
-            let tile_json = serde_json::json!({
-                "input_data": crate::tensor::arrayd_to_json(&tile.clone().into_dyn())
-            });
-            let request = DSliceRequest {
-                circuit: circuit.clone(),
-                inputs: tile_json,
-                request_type: RequestType::DSlice,
-                proof_system: circuit.proof_system,
-                slice_num: slice_id.to_string(),
-                run_uid: run_uid.to_string(),
-                outputs: None,
-                is_tile: false,
-                tile_idx: None,
-                task_id: None,
-                run_source,
-                retry_count: 0,
-                circuit_path: circuit_path.map(String::from),
-            };
-            self.api_dslice_queue.push_back(request);
-
-            {
-                let uid = run_uid.to_string();
-                let snum = slice_id.to_string();
-                self.emit_event(move |ev| async move {
-                    ev.emit_work_items_created(&uid, &snum, 1).await;
-                });
+    ) -> Option<usize> {
+        let input_4d = match input_tensor.into_dimensionality::<ndarray::Ix4>() {
+            Ok(arr) => arr,
+            Err(e) => {
+                warn!(run_uid = %run_uid, slice = %slice_id, error = %e, "tiled slice requires 4D input");
+                return None;
             }
+        };
+        let tiles = match dsperse::pipeline::split_into_tiles(&input_4d, tiling) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(run_uid = %run_uid, slice = %slice_id, error = %e, "split_into_tiles failed");
+                return None;
+            }
+        };
 
-            return;
-        }
-
-        info!(
-            run_uid = %run_uid,
-            slice = %slice_id,
-            num_tiles,
-            "dispatching spatial tiles"
-        );
-
-        if let Err(e) = self
-            .run_manager
-            .init_tile_buffer(run_uid, slice_id, tiling.clone())
-        {
+        let num_tiles = tiles.len();
+        if num_tiles == 0 || num_tiles != tiling.num_tiles {
             warn!(
                 run_uid = %run_uid,
                 slice = %slice_id,
-                error = %e,
-                "init_tile_buffer failed"
+                actual = num_tiles,
+                expected = tiling.num_tiles,
+                "tile count mismatch or zero"
             );
-            self.teardown_run(run_uid).await;
-            return;
+            return None;
+        }
+
+        if let Err(e) = run_manager.init_tile_counter(run_uid, slice_id, tiling) {
+            warn!(run_uid = %run_uid, slice = %slice_id, error = %e, "init_tile_counter failed");
+            return None;
         }
 
         for (idx, tile) in tiles.into_iter().enumerate() {
             let tile_json = serde_json::json!({
                 "input_data": crate::tensor::arrayd_to_json(&tile.into_dyn())
             });
-            let request = DSliceRequest {
+            staged.stage_request(DSliceRequest {
                 circuit: circuit.clone(),
                 inputs: tile_json,
                 request_type: RequestType::DSlice,
@@ -574,18 +418,31 @@ impl ValidatorLoop {
                 run_source,
                 retry_count: 0,
                 circuit_path: circuit_path.map(String::from),
-            };
-            self.stacked_dslice_queue.push_back(request);
-        }
-
-        {
-            let uid = run_uid.to_string();
-            let snum = slice_id.to_string();
-            let nt = num_tiles;
-            self.emit_event(move |ev| async move {
-                ev.emit_work_items_created(&uid, &snum, nt).await;
             });
         }
+
+        Some(num_tiles)
+    }
+
+    pub(super) async fn finalize_combined_run(&mut self, run_uid: &str) {
+        self.cleanup_extracted_slices(run_uid).await;
+        self.dslice_input_scales
+            .retain(|(uid, _), _| uid != run_uid);
+
+        info!(run_uid = %run_uid, "combined run complete");
+
+        let final_output = self.run_manager.final_output_json(run_uid);
+        let mut active_run = self.run_manager.remove_run(run_uid);
+
+        if let Some(ref run) = active_run {
+            self.report_dsperse_completion(run);
+            self.spawn_emit_run_complete(run, true);
+        }
+
+        let relay_output = final_output.clone();
+        self.spawn_artifact_upload(run_uid, &mut active_run, final_output);
+        self.notify_run_completed(run_uid, &active_run, relay_output)
+            .await;
     }
 
     pub(super) async fn replenish_dslice_queues(&mut self) {
@@ -641,17 +498,27 @@ impl ValidatorLoop {
         });
         let slices_dir = circuit.paths.base_path.join("slices");
 
-        let incremental = match dsperse::pipeline::IncrementalRun::new(&slices_dir, input) {
-            Ok(r) => r,
+        let dir = slices_dir.clone();
+        let combined = match tokio::task::spawn_blocking(move || {
+            dsperse::pipeline::CombinedRun::new(&dir, input)
+        })
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                warn!(error = %e, circuit = %circuit.id, "benchmark combined inference failed");
+                self.dsperse_benchmark_backoff_until = Instant::now() + Duration::from_secs(60);
+                return;
+            }
             Err(e) => {
-                warn!(error = %e, circuit = %circuit.id, "failed to create benchmark IncrementalRun");
+                warn!(error = %e, circuit = %circuit.id, "benchmark combined inference panicked");
                 self.dsperse_benchmark_backoff_until = Instant::now() + Duration::from_secs(60);
                 return;
             }
         };
 
         let run_uid = uuid::Uuid::new_v4().to_string();
-        info!(run_uid = %run_uid, circuit = %circuit.id, name = %circuit.metadata.name, "started dsperse benchmark run");
+        info!(run_uid = %run_uid, circuit = %circuit.id, name = %circuit.metadata.name, "started combined benchmark run");
 
         self.run_manager.start_run(
             run_uid.clone(),
@@ -659,7 +526,7 @@ impl ValidatorLoop {
             circuit.metadata.name.clone(),
             RunSource::Benchmark,
             None,
-            Some(incremental),
+            Some(combined),
         );
 
         {
@@ -682,7 +549,7 @@ impl ValidatorLoop {
         }
 
         let circuit = circuit.clone();
-        self.enqueue_next_dslice(&run_uid, &circuit).await;
-        self.dispatch_notify.notify_one();
+        self.enqueue_all_dslices(&run_uid, &circuit, RunSource::Benchmark)
+            .await;
     }
 }
