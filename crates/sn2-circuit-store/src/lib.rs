@@ -149,10 +149,14 @@ impl CircuitStore {
             return Ok(());
         }
 
-        let mut api_circuits = self.fetch_circuits_from_api().await.unwrap_or_else(|e| {
-            warn!(error = %e, "failed to fetch circuits from API, loading from cache only");
-            Vec::new()
-        });
+        let (mut api_circuits, complete) =
+            self.fetch_circuits_from_api().await.unwrap_or_else(|e| {
+                warn!(error = %e, "failed to fetch circuits from API, loading from cache only");
+                (Vec::new(), false)
+            });
+        if !complete && !api_circuits.is_empty() {
+            warn!("partial API response during startup, proceeding with available circuits");
+        }
 
         let mut active_ids: HashSet<String> = api_circuits
             .iter()
@@ -189,7 +193,7 @@ impl CircuitStore {
                         self.circuits.insert(id.to_string(), circuit);
                     }
                     Err(e) => {
-                        warn!(id = id, error = %e, "failed to cache circuit");
+                        warn!(id = id, error = ?e, "failed to cache circuit");
                     }
                 }
             }
@@ -213,19 +217,7 @@ impl CircuitStore {
         }
 
         info!(id = circuit_id, "circuit not loaded, fetching from API");
-        let url = format!("{}/circuits/{}", self.api_url, circuit_id);
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .context("fetching circuit from API")?;
-
-        if !resp.status().is_success() {
-            anyhow::bail!("API returned {} for circuit {}", resp.status(), circuit_id);
-        }
-
-        let data: serde_json::Value = resp.json().await.context("parsing circuit response")?;
+        let data = self.fetch_circuit_or_model(circuit_id).await?;
         let circuit = self.cache_and_load_circuit(circuit_id, &data).await?;
         self.circuits
             .insert(circuit_id.to_string(), circuit.clone());
@@ -233,7 +225,7 @@ impl CircuitStore {
     }
 
     pub async fn refresh_circuits(&mut self) -> Result<Vec<String>> {
-        let api_circuits = self.fetch_circuits_from_api().await?;
+        let (api_circuits, complete) = self.fetch_circuits_from_api().await?;
         let active_ids: HashSet<String> = api_circuits
             .iter()
             .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(String::from))
@@ -260,8 +252,12 @@ impl CircuitStore {
             }
         }
 
-        if active_ids.is_empty() {
-            warn!("circuit API returned empty active set, skipping removal");
+        if active_ids.is_empty() || !complete {
+            if !complete {
+                warn!("partial API response, skipping circuit removal");
+            } else {
+                warn!("circuit API returned empty active set, skipping removal");
+            }
             return Ok(Vec::new());
         }
 
@@ -307,7 +303,10 @@ impl CircuitStore {
     }
 
     pub fn is_downloading(&self, circuit_id: &str) -> bool {
-        self.inflight_downloads.lock().unwrap().contains(circuit_id)
+        match self.inflight_downloads.lock() {
+            Ok(set) => set.contains(circuit_id),
+            Err(poisoned) => poisoned.into_inner().contains(circuit_id),
+        }
     }
 
     pub fn is_dsperse_ready(&self, circuit_id: &str) -> bool {
@@ -321,27 +320,153 @@ impl CircuitStore {
 
     pub const REFRESH_INTERVAL: u64 = REFRESH_INTERVAL_SECS;
 
-    async fn fetch_circuits_from_api(&self) -> Result<Vec<serde_json::Value>> {
-        let url = format!("{}/circuits", self.api_url);
+    async fn fetch_circuit_or_model(&self, id: &str) -> Result<serde_json::Value> {
+        let circuit_url = format!("{}/circuits/{}", self.api_url, id);
         let resp = self
             .http
-            .get(&url)
+            .get(&circuit_url)
             .send()
             .await
-            .context("fetching circuits list")?;
+            .context("fetching circuit from API")?;
 
-        if !resp.status().is_success() {
-            anyhow::bail!("API returned {}", resp.status());
+        if resp.status().is_success() {
+            return resp.json().await.context("parsing circuit response");
         }
 
-        let data: serde_json::Value = resp.json().await.context("parsing circuits response")?;
-        let circuits = data
-            .get("circuits")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
+        if resp.status().as_u16() != 404 {
+            anyhow::bail!("API returned {} for circuit {}", resp.status(), id);
+        }
 
-        Ok(circuits)
+        info!(id, "circuit not found (404), trying models endpoint");
+        let model_url = format!("{}/models/{}", self.api_url, id);
+        let model_resp = self
+            .http
+            .get(&model_url)
+            .send()
+            .await
+            .context("fetching model from API")?;
+
+        if !model_resp.status().is_success() {
+            anyhow::bail!(
+                "API returned {} for circuit/model {}",
+                model_resp.status(),
+                id
+            );
+        }
+
+        let model: serde_json::Value = model_resp.json().await.context("parsing model response")?;
+        Ok(self.normalize_model_to_circuit(&model))
+    }
+
+    fn normalize_model_to_circuit(&self, model: &serde_json::Value) -> serde_json::Value {
+        let metadata = model.get("metadata").cloned().unwrap_or_default();
+        let composition = model.get("composition").cloned().unwrap_or_default();
+
+        let str_field = |obj: &serde_json::Value, key: &str| -> String {
+            obj.get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+
+        let proof_system = composition
+            .get("components")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|c| c.get("proof_system"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("JSTPROVE")
+            .to_string();
+
+        serde_json::json!({
+            "id": str_field(model, "id"),
+            "metadata": {
+                "name": str_field(&metadata, "name"),
+                "description": str_field(&metadata, "description"),
+                "author": str_field(&metadata, "author"),
+                "version": str_field(&metadata, "version"),
+                "type": "DSPERSE_PROOF_GENERATION",
+                "proof_system": proof_system,
+                "netuid": metadata.get("netuid").cloned().unwrap_or(serde_json::Value::Null),
+                "weights_version": metadata.get("weights_version").cloned().unwrap_or(serde_json::Value::Null),
+                "timeout": metadata.get("timeout").cloned().unwrap_or(serde_json::json!(3600)),
+                "input_schema": metadata.get("input_schema").cloned().unwrap_or_default(),
+                "image_url": metadata.get("image_url").cloned().unwrap_or(serde_json::Value::Null),
+            },
+            "composition": composition,
+            "files": {},
+            "is_active": model.get("is_active").cloned().unwrap_or(serde_json::json!(1)),
+            "created_at": model.get("created_at").cloned().unwrap_or_default(),
+            "updated_at": model.get("updated_at").cloned().unwrap_or_default(),
+        })
+    }
+
+    async fn fetch_circuits_from_api(&self) -> Result<(Vec<serde_json::Value>, bool)> {
+        let mut all = Vec::new();
+        let mut circuits_ok = false;
+        let mut models_ok = false;
+
+        let circuits_url = format!("{}/circuits", self.api_url);
+        match self.http.get(&circuits_url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(data) => {
+                        if let Some(circuits) = data.get("circuits").and_then(|v| v.as_array()) {
+                            all.extend(circuits.iter().cloned());
+                            circuits_ok = true;
+                        } else {
+                            warn!("circuits response missing 'circuits' array");
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "failed to parse circuits response"),
+                }
+            }
+            Ok(resp) => warn!(status = %resp.status(), "circuits endpoint returned error"),
+            Err(e) => warn!(error = %e, "failed to reach circuits endpoint"),
+        }
+
+        let models_url = format!("{}/models", self.api_url);
+        match self.http.get(&models_url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(data) => {
+                        if let Some(models) = data.get("models").and_then(|v| v.as_array()) {
+                            let mut existing_ids: std::collections::HashSet<String> = all
+                                .iter()
+                                .filter_map(|c| {
+                                    c.get("id").and_then(|v| v.as_str()).map(String::from)
+                                })
+                                .collect();
+                            for model in models {
+                                let Some(id) = model
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.is_empty())
+                                else {
+                                    continue;
+                                };
+                                if existing_ids.insert(id.to_string()) {
+                                    all.push(self.normalize_model_to_circuit(model));
+                                }
+                            }
+                            models_ok = true;
+                        } else {
+                            warn!("models response missing 'models' array");
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "failed to parse models response"),
+                }
+            }
+            Ok(resp) => warn!(status = %resp.status(), "models endpoint returned error"),
+            Err(e) => warn!(error = %e, "failed to reach models endpoint"),
+        }
+
+        if !circuits_ok && !models_ok {
+            anyhow::bail!("both circuits and models endpoints failed");
+        }
+
+        let complete = circuits_ok && models_ok;
+        Ok((all, complete))
     }
 
     async fn fetch_pinned_circuits(
@@ -397,45 +522,66 @@ impl CircuitStore {
         let metadata_json = serde_json::to_string_pretty(metadata_value)?;
         let is_dsperse = metadata.circuit_type == CircuitType::DSPERSE_PROOF_GENERATION;
 
-        let files = resolve_files(data);
-        if files.is_empty() && data.get("files").is_some() {
-            warn!(
-                circuit_id,
-                "API provided files but none could be resolved, circuit may be unusable"
-            );
-        }
-        if !files.is_empty() {
-            if is_dsperse {
-                let slices_dir = cache_path.join("slices");
-                std::fs::create_dir_all(&slices_dir)
-                    .with_context(|| format!("creating slices dir {}", slices_dir.display()))?;
-            }
+        let has_composition = data.get("composition").is_some_and(|c| {
+            c.get("components")
+                .and_then(|a| a.as_array())
+                .is_some_and(|a| !a.is_empty())
+        });
 
-            let file_map = data.get("file_map").and_then(|v| v.as_object());
-            let explicit_checksums = data
-                .get("checksums")
-                .and_then(|v| v.as_object())
-                .cloned()
-                .unwrap_or_default();
-            let checksums = derive_checksums(file_map, &explicit_checksums);
-
-            let deferred_downloads = match self
-                .download_circuit_files(&files, &cache_path, is_dsperse, &checksums)
+        if has_composition && is_dsperse {
+            match self
+                .download_composable_model(circuit_id, data, &cache_path)
                 .await
             {
-                Ok(d) => d,
+                Ok(()) => {}
                 Err(e) => {
                     if is_fresh {
                         let _ = std::fs::remove_dir_all(&cache_path);
                     }
-                    return Err(e);
+                    return Err(e.context("downloading composable model"));
                 }
-            };
+            }
+        } else {
+            let files = resolve_files(data);
+            if files.is_empty() && data.get("files").is_some() {
+                warn!(
+                    circuit_id,
+                    "API provided files but none could be resolved, circuit may be unusable"
+                );
+            }
+            if !files.is_empty() {
+                if is_dsperse {
+                    let slices_dir = cache_path.join("slices");
+                    std::fs::create_dir_all(&slices_dir)
+                        .with_context(|| format!("creating slices dir {}", slices_dir.display()))?;
+                }
 
-            if !deferred_downloads.is_empty() {
-                self.spawn_deferred_downloads(circuit_id, &cache_path, deferred_downloads);
-            } else if is_dsperse {
-                let _ = std::fs::write(cache_path.join(DSLICE_READY_MARKER), b"");
+                let file_map = data.get("file_map").and_then(|v| v.as_object());
+                let explicit_checksums = data
+                    .get("checksums")
+                    .and_then(|v| v.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                let checksums = derive_checksums(file_map, &explicit_checksums);
+
+                let deferred_downloads = match self
+                    .download_circuit_files(&files, &cache_path, is_dsperse, &checksums)
+                    .await
+                {
+                    Ok(d) => d,
+                    Err(e) => {
+                        if is_fresh {
+                            let _ = std::fs::remove_dir_all(&cache_path);
+                        }
+                        return Err(e);
+                    }
+                };
+
+                if !deferred_downloads.is_empty() {
+                    self.spawn_deferred_downloads(circuit_id, &cache_path, deferred_downloads);
+                } else if is_dsperse {
+                    let _ = std::fs::write(cache_path.join(DSLICE_READY_MARKER), b"");
+                }
             }
         }
 
@@ -462,6 +608,189 @@ impl CircuitStore {
             settings,
             timeout: CIRCUIT_TIMEOUT_SECONDS as f64,
         })
+    }
+
+    async fn download_composable_model(
+        &self,
+        model_id: &str,
+        data: &serde_json::Value,
+        cache_path: &Path,
+    ) -> Result<()> {
+        let composition = data.get("composition").context("missing composition")?;
+        let components = composition
+            .get("components")
+            .and_then(|v| v.as_array())
+            .context("missing composition.components")?;
+
+        let slices_dir = cache_path.join("slices");
+        std::fs::create_dir_all(&slices_dir)?;
+
+        let total = components.len();
+        info!(model_id, total, "downloading composable model components");
+
+        self.inflight_downloads
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(model_id.to_string());
+
+        let result = self
+            .download_composable_components(&slices_dir, components, model_id, data)
+            .await;
+
+        self.inflight_downloads
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(model_id);
+
+        match result {
+            Ok(()) => {
+                let _ = std::fs::write(cache_path.join(DSLICE_READY_MARKER), b"");
+                info!(model_id, total, "composable model download complete");
+                Ok(())
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(cache_path.join(DSLICE_READY_MARKER));
+                Err(e)
+            }
+        }
+    }
+
+    fn sanitize_name<'a>(raw: &'a str, context: &str) -> Result<&'a str> {
+        anyhow::ensure!(
+            !raw.is_empty()
+                && raw != ".."
+                && !raw.contains('/')
+                && !raw.contains('\\')
+                && !raw.contains('\0'),
+            "{context}: invalid name {raw:?}"
+        );
+        Ok(raw)
+    }
+
+    async fn download_composable_components(
+        &self,
+        slices_dir: &Path,
+        components: &[serde_json::Value],
+        model_id: &str,
+        data: &serde_json::Value,
+    ) -> Result<()> {
+        let total = components.len();
+
+        for (idx, comp) in components.iter().enumerate() {
+            let default_name = format!("slice_{idx}");
+            let raw_name = comp
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&default_name);
+            let comp_name = Self::sanitize_name(raw_name, "component name")?;
+            let comp_sha = comp
+                .get("sha256")
+                .and_then(|v| v.as_str())
+                .context("component missing sha256")?;
+            let comp_files = comp
+                .get("files")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let weights = comp
+                .get("weights")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            let has_circuit = comp_files.iter().any(|f| f.as_str() == Some("circuit.bin"));
+
+            if has_circuit {
+                let bundle_dir = slices_dir
+                    .join(comp_name)
+                    .join("jstprove")
+                    .join("circuit.bundle");
+                std::fs::create_dir_all(&bundle_dir)?;
+
+                for file_val in &comp_files {
+                    let raw_filename = file_val.as_str().unwrap_or_default();
+                    if raw_filename.is_empty() {
+                        continue;
+                    }
+                    let filename = Self::sanitize_name(raw_filename, "component file")?;
+                    let dest = bundle_dir.join(filename);
+                    if dest.exists() {
+                        continue;
+                    }
+                    let url = format!(
+                        "{}/components/{}/files/{}",
+                        self.api_url, comp_sha, filename
+                    );
+                    self.download_file(&url, &dest).await.with_context(|| {
+                        format!("downloading component file {comp_name}/{filename}")
+                    })?;
+                }
+            }
+
+            let payload_dir = slices_dir.join(comp_name).join("payload");
+            std::fs::create_dir_all(&payload_dir)?;
+
+            for wb in &weights {
+                let wb_sha = wb
+                    .get("sha256")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .with_context(|| format!("{comp_name}: weight blob missing sha256"))?;
+                let default_wb = format!("{comp_name}.onnx");
+                let raw_wb = wb
+                    .get("filename")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&default_wb);
+                let wb_filename = Self::sanitize_name(raw_wb, "weight blob file")?;
+                let dest = payload_dir.join(wb_filename);
+                if dest.exists() {
+                    continue;
+                }
+                let url = format!("{}/models/wb/{}", self.api_url, wb_sha);
+                self.download_file(&url, &dest)
+                    .await
+                    .with_context(|| format!("downloading weight blob for {comp_name}"))?;
+            }
+
+            if (idx + 1) % 50 == 0 || idx + 1 == total {
+                info!(
+                    model_id,
+                    progress = idx + 1,
+                    total,
+                    "composable model download progress"
+                );
+            }
+        }
+
+        if let Some(artifacts) = data
+            .get("composition")
+            .and_then(|c| c.get("artifacts"))
+            .and_then(|a| a.as_array())
+        {
+            for artifact in artifacts {
+                let sha = artifact
+                    .get("sha256")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .context("model artifact missing sha256")?;
+                let raw_filename = artifact
+                    .get("filename")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let filename = Self::sanitize_name(raw_filename, "model artifact")?;
+                let dest = slices_dir.join(filename);
+                if dest.exists() {
+                    continue;
+                }
+                let url = format!("{}/models/wb/{}", self.api_url, sha);
+                self.download_file(&url, &dest)
+                    .await
+                    .with_context(|| format!("downloading model artifact {filename}"))?;
+                info!(filename, "downloaded model artifact");
+            }
+        }
+
+        Ok(())
     }
 
     async fn download_circuit_files(
@@ -539,7 +868,7 @@ impl CircuitStore {
         if !self
             .inflight_downloads
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .insert(circuit_id.to_string())
         {
             return;
