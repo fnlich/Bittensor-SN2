@@ -80,12 +80,6 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Remove previous testnet release
-        run: gh release delete testnet-latest --cleanup-tag --yes || true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
@@ -97,20 +91,43 @@ jobs:
           cd ..
           sha256sum sn2-validator-linux-x86_64 sn2-miner-linux-x86_64 sn2-validator-linux-aarch64 sn2-miner-linux-aarch64 sn2-validator-macos-aarch64 sn2-miner-macos-aarch64 > SHA256SUMS
 
-      - name: Create Testnet Release
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
-        with:
-          tag_name: testnet-latest
-          name: Testnet (latest)
-          body: "Built from ${{ github.sha }}"
-          prerelease: true
-          make_latest: false
-          target_commitish: testnet
-          files: |
-            sn2-validator-linux-x86_64
-            sn2-miner-linux-x86_64
-            sn2-validator-linux-aarch64
-            sn2-miner-linux-aarch64
-            sn2-validator-macos-aarch64
-            sn2-miner-macos-aarch64
-            SHA256SUMS
+      - name: Update Testnet Release
+        run: |
+          if gh release view testnet-latest >/dev/null 2>&1; then
+            gh release delete-asset testnet-latest sn2-validator-linux-x86_64 --yes || true
+            gh release delete-asset testnet-latest sn2-miner-linux-x86_64 --yes || true
+            gh release delete-asset testnet-latest sn2-validator-linux-aarch64 --yes || true
+            gh release delete-asset testnet-latest sn2-miner-linux-aarch64 --yes || true
+            gh release delete-asset testnet-latest sn2-validator-macos-aarch64 --yes || true
+            gh release delete-asset testnet-latest sn2-miner-macos-aarch64 --yes || true
+            gh release delete-asset testnet-latest SHA256SUMS --yes || true
+            gh release edit testnet-latest \
+              --title "Testnet (latest)" \
+              --notes "Built from ${{ github.sha }}" \
+              --prerelease \
+              --target testnet
+            gh release upload testnet-latest \
+              sn2-validator-linux-x86_64 \
+              sn2-miner-linux-x86_64 \
+              sn2-validator-linux-aarch64 \
+              sn2-miner-linux-aarch64 \
+              sn2-validator-macos-aarch64 \
+              sn2-miner-macos-aarch64 \
+              SHA256SUMS
+          else
+            gh release create testnet-latest \
+              --title "Testnet (latest)" \
+              --notes "Built from ${{ github.sha }}" \
+              --prerelease \
+              --target testnet \
+              sn2-validator-linux-x86_64 \
+              sn2-miner-linux-x86_64 \
+              sn2-validator-linux-aarch64 \
+              sn2-miner-linux-aarch64 \
+              sn2-validator-macos-aarch64 \
+              sn2-miner-macos-aarch64 \
+              SHA256SUMS
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
