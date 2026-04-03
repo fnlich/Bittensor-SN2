@@ -25,33 +25,105 @@ fn resolve_circuit_path(response: &MinerResponse, circuit: &Circuit) -> String {
     circuit.paths.compiled_model.to_string_lossy().to_string()
 }
 
-fn resolve_num_inputs(
+struct CircuitContext {
+    num_inputs: usize,
+    weights_as_inputs: bool,
+    output_names: Vec<String>,
+}
+
+fn load_circuit_context(
     circuit: &Circuit,
     inputs: &Option<serde_json::Value>,
     circuit_path: &str,
-) -> usize {
-    if let Some(n) = circuit
+) -> CircuitContext {
+    let backend = dsperse::backend::jstprove::JstproveBackend::new();
+    let params = backend
+        .load_params(std::path::Path::new(circuit_path))
+        .ok()
+        .flatten();
+
+    let num_inputs = circuit
         .settings
         .get("num_inputs")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-    {
-        return n;
+        .or_else(|| {
+            params
+                .as_ref()
+                .map(|p| p.effective_input_dims())
+                .filter(|d| *d > 0)
+        })
+        .unwrap_or_else(|| {
+            inputs
+                .as_ref()
+                .and_then(|v| v.get("input_data"))
+                .map(|v| sn2_types::json_tensor::flatten_json_to_f64(v).len())
+                .unwrap_or(0)
+        });
+
+    let weights_as_inputs = params.as_ref().is_some_and(|p| p.weights_as_inputs);
+    let output_names = params
+        .as_ref()
+        .map(|p| p.outputs.iter().map(|o| o.name.clone()).collect())
+        .unwrap_or_default();
+
+    CircuitContext {
+        num_inputs,
+        weights_as_inputs,
+        output_names,
     }
+}
+
+fn build_expected_inputs(
+    activation_inputs: &Option<serde_json::Value>,
+    ctx: &CircuitContext,
+    circuit_path: &str,
+) -> Option<Vec<f64>> {
+    let mut flat: Vec<f64> = activation_inputs
+        .as_ref()
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect())?;
+
+    if flat.is_empty() {
+        return None;
+    }
+
+    if !ctx.weights_as_inputs {
+        return Some(flat);
+    }
+
+    let bundle_path = std::path::Path::new(circuit_path);
+    let slice_dir = bundle_path.parent().and_then(|p| p.parent())?;
+    let payload_dir = slice_dir.join("payload");
+
+    let onnx_path = std::fs::read_dir(&payload_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "onnx"))?;
 
     let backend = dsperse::backend::jstprove::JstproveBackend::new();
-    if let Ok(Some(params)) = backend.load_params(std::path::Path::new(circuit_path)) {
-        let dims = params.effective_input_dims();
-        if dims > 0 {
-            return dims;
+    let params = backend
+        .load_params(std::path::Path::new(circuit_path))
+        .ok()
+        .flatten()?;
+
+    match dsperse::pipeline::extract_onnx_initializers(&onnx_path, &params) {
+        Ok(inits) => {
+            for (data, _shape) in inits {
+                flat.extend(data);
+            }
+            Some(flat)
+        }
+        Err(e) => {
+            tracing::warn!(
+                onnx = %onnx_path.display(),
+                error = %e,
+                "failed to extract weight initializers for input verification"
+            );
+            Some(flat)
         }
     }
-
-    inputs
-        .as_ref()
-        .and_then(|v| v.get("input_data"))
-        .map(|v| sn2_types::json_tensor::flatten_json_to_f64(v).len())
-        .unwrap_or(0)
 }
 
 fn compute_slice_stats(data: &[f64]) -> (f64, usize, usize, usize) {
@@ -125,13 +197,9 @@ impl ResponseProcessor {
             return Ok(false);
         }
 
-        let num_inputs = resolve_num_inputs(circuit, &response.inputs, &circuit_path);
-
-        let expected_inputs: Option<Vec<f64>> = response
-            .inputs
-            .as_ref()
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect());
+        let ctx = load_circuit_context(circuit, &response.inputs, &circuit_path);
+        let num_inputs = ctx.num_inputs;
+        let expected_inputs = build_expected_inputs(&response.inputs, &ctx, &circuit_path);
 
         let pcs_type = circuit
             .settings
