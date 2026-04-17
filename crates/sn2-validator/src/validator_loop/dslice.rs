@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use rand::Rng;
 use sn2_types::*;
 use tracing::{info, warn};
 
@@ -469,7 +470,7 @@ impl ValidatorLoop {
         if dsperse_circuits.is_empty() {
             return;
         }
-        let idx = rand::Rng::gen_range(&mut rand::thread_rng(), 0..dsperse_circuits.len());
+        let idx = rand::rng().random_range(0..dsperse_circuits.len());
         let circuit = &dsperse_circuits[idx];
 
         let schema = match &circuit.metadata.input_schema {
@@ -506,9 +507,9 @@ impl ValidatorLoop {
             }
         };
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let input = ndarray::ArrayD::from_shape_fn(ndarray::IxDyn(&shape), |_| {
-            rand::Rng::gen_range(&mut rng, 0.0_f64..1.0)
+            rng.random_range(0.0_f64..1.0)
         });
         let slices_dir = circuit.paths.base_path.join("slices");
 
