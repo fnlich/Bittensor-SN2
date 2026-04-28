@@ -24,6 +24,7 @@ allow = [
     "MPL-2.0",
     "Unlicense",
     "CDLA-Permissive-2.0",
+    "LicenseRef-Inference-Labs-Source-Grant",
 ]
 confidence-threshold = 0.8
 
@@ -38,6 +39,125 @@ name = "encoding_rs"
 expression = "Apache-2.0 OR MIT"
 license-files = [{ path = "LICENSE-APACHE", hash = 0xb23f3e28 }, { path = "LICENSE-MIT", hash = 0xb23f3e28 }]
 
+# Inference Labs internal crates pulled transitively via JSTprove and dsperse.
+# These crates ship without a SPDX license declaration; their upstream LICENSE
+# file is the Inference Labs Source Access Grant, vendored at
+# LICENSES/LicenseRef-Inference-Labs-Source-Grant.txt for human audit.
+# Pinned to exact versions so a future republished version cannot inherit the
+# clarification.
+[[licenses.clarify]]
+crate = "arith@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "babybear@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "bin@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "circuit@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "circuit-std-rs@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "config_macros@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "crosslayer_prototype@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "dsperse@0.0.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "expander_compiler@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "gf2@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "gf2_128@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "gkr@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "gkr_engine@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "gkr_hashers@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "goldilocks@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "jstprove-io@0.1.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "jstprove-onnx@0.1.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "jstprove_circuits@0.1.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "macros@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "mersenne31@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "poly_commit@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "polynomials@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "serdes@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "serdes_derive@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "sumcheck@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "transcript@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "tree@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+[[licenses.clarify]]
+crate = "utils@0.4.0"
+expression = "LicenseRef-Inference-Labs-Source-Grant"
+license-files = []
+
 [bans]
 multiple-versions = "warn"
 wildcards = "warn"
@@ -48,4 +168,6 @@ unknown-git = "deny"
 allow-git = [
     "https://github.com/inference-labs-inc/btlightning.git",
     "https://github.com/inference-labs-inc/dsperse",
+    "https://github.com/inference-labs-inc/JSTprove.git",
+    "https://github.com/inference-labs-inc/bittensor-drand.git",
 ]
