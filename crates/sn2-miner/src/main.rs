@@ -1,8 +1,10 @@
 mod cli;
 mod dsperse;
+mod firewall;
 mod handlers;
 mod lightning_server;
 mod permit_resolver;
+mod source_resolver;
 
 use std::sync::Arc;
 
@@ -13,7 +15,7 @@ use tokio::sync::watch;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use crate::cli::Cli;
+use crate::cli::{Cli, Command};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -22,6 +24,17 @@ async fn main() -> Result<()> {
     sn2_types::init_tracing(&cli.log_level);
 
     info!(version = sn2_types::SOFTWARE_VERSION, "sn2-miner");
+
+    if let Some(Command::Firewall { out }) = cli.command.clone() {
+        return firewall::emit_nftables(
+            cli.netuid,
+            &cli.network,
+            cli.subtensor_chain_endpoint.as_deref(),
+            cli.axon_port,
+            out,
+        )
+        .await;
+    }
 
     if cli.loopback {
         return run_loopback(cli).await;
@@ -111,6 +124,14 @@ async fn main() -> Result<()> {
             metagraph.clone(),
         )))
     };
+    let source_resolver: Option<Box<dyn btlightning::SourceAddressResolver>> =
+        if cli.disable_blacklist {
+            None
+        } else {
+            Some(Box::new(source_resolver::MetagraphSourceResolver::new(
+                metagraph.clone(),
+            )))
+        };
     let quic_handle = {
         let handlers = handlers.clone();
         let hotkey = wallet.hotkey_ss58().to_string();
@@ -128,6 +149,7 @@ async fn main() -> Result<()> {
                 handler_timeout,
                 handlers,
                 permit_resolver,
+                source_resolver,
             )
             .await
         })
@@ -235,6 +257,7 @@ async fn run_loopback(cli: Cli) -> Result<()> {
                 port,
                 handler_timeout,
                 handlers,
+                None,
                 None,
             )
             .await
