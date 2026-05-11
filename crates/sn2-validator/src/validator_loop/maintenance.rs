@@ -217,22 +217,32 @@ impl ValidatorLoop {
             .context("sync_metagraph requires chain_client")?;
         let sync_result = self.config.metagraph.sync(chain_client).await;
         if let Err(ref e) = sync_result {
-            if sn2_chain::is_rpc_disconnect(e) {
-                warn!(error = ?e, "chain RPC connection dead, reconnecting");
+            let force_reconnect = self.consecutive_metagraph_failures + 1
+                >= super::METAGRAPH_FAILURE_RECONNECT_THRESHOLD;
+            if sn2_chain::is_rpc_disconnect(e) || force_reconnect {
+                warn!(
+                    error = ?e,
+                    consecutive_failures = self.consecutive_metagraph_failures + 1,
+                    classified_disconnect = sn2_chain::is_rpc_disconnect(e),
+                    "chain RPC unresponsive, forcing reconnect",
+                );
+                self.consecutive_metagraph_failures = 0;
                 self.config.reconnect_chain_client().await?;
                 let chain_client = self
                     .config
                     .chain_client
                     .as_ref()
                     .context("chain_client missing after reconnect")?;
-                self.config
-                    .metagraph
-                    .sync(chain_client)
-                    .await
-                    .context("metagraph sync after reconnect")?;
+                if let Err(retry_err) = self.config.metagraph.sync(chain_client).await {
+                    self.consecutive_metagraph_failures = 1;
+                    return Err(retry_err).context("metagraph sync after reconnect");
+                }
             } else {
+                self.consecutive_metagraph_failures += 1;
                 sync_result.context("metagraph sync")?;
             }
+        } else {
+            self.consecutive_metagraph_failures = 0;
         }
 
         let uids = self.config.metagraph.uids();
