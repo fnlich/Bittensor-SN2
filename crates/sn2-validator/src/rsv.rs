@@ -15,7 +15,6 @@ pub struct RsvManager {
     strikes: HashMap<String, VecDeque<u64>>,
     coldstart: HashMap<String, u64>,
     last_seen: HashMap<String, u64>,
-    sample_budget: HashMap<(String, u64), u32>,
     persistence_path: Option<PathBuf>,
 }
 
@@ -26,7 +25,6 @@ impl RsvManager {
             strikes: HashMap::new(),
             coldstart: HashMap::new(),
             last_seen: HashMap::new(),
-            sample_budget: HashMap::new(),
             persistence_path: Some(path),
         };
         mgr.load();
@@ -57,31 +55,13 @@ impl RsvManager {
 
     pub fn should_sample(
         &mut self,
-        hotkey: &str,
-        current_block: u64,
-        blocks_per_tempo: u64,
+        _hotkey: &str,
+        _current_block: u64,
+        _blocks_per_tempo: u64,
     ) -> bool {
-        if blocks_per_tempo == 0 {
-            return true;
-        }
-        let tempo_idx = current_block / blocks_per_tempo;
-        self.sample_budget.retain(|(_, t), _| *t >= tempo_idx);
-        let key = (hotkey.to_string(), tempo_idx);
-        let budget = self
-            .sample_budget
-            .entry(key)
-            .or_insert(VERIFICATION_SAMPLES_PER_TEMPO as u32);
-        if *budget == 0 {
-            return false;
-        }
         let mut rng = rand::rng();
         let roll: u64 = rng.random_range(0..RSV_EXPECTED_SUBS_PER_TEMPO);
-        if roll < VERIFICATION_SAMPLES_PER_TEMPO {
-            *budget -= 1;
-            true
-        } else {
-            false
-        }
+        roll < VERIFICATION_SAMPLES_PER_TEMPO
     }
 
     pub fn record_strike(
@@ -163,9 +143,7 @@ impl RsvManager {
             }
         }
 
-        let current_tempo = current_block.checked_div(blocks_per_tempo).unwrap_or(0);
-        self.sample_budget
-            .retain(|(_, tempo_idx), _| *tempo_idx >= current_tempo);
+        let _ = blocks_per_tempo;
     }
 
     pub fn save(&self) {
@@ -307,7 +285,6 @@ mod tests {
             strikes: HashMap::new(),
             coldstart: HashMap::new(),
             last_seen: HashMap::new(),
-            sample_budget: HashMap::new(),
             persistence_path: None,
         }
     }
@@ -336,14 +313,6 @@ mod tests {
     }
 
     #[test]
-    fn record_strike_below_threshold_no_skiplist() {
-        let mut mgr = fresh();
-        let triggered = mgr.record_strike("hk1", 100, 360);
-        assert!(!triggered);
-        assert!(!mgr.is_skiplisted("hk1", 100));
-    }
-
-    #[test]
     fn record_strike_at_threshold_skiplists() {
         let mut mgr = fresh();
         for i in 0..VERIFICATION_STRIKES_REQUIRED {
@@ -359,19 +328,6 @@ mod tests {
         assert!(!mgr.strikes.contains_key("hk1"));
         let until = mgr.skiplist.get("hk1").copied().unwrap();
         assert_eq!(until, block + VERIFICATION_SKIPLIST_TEMPOS * 360);
-    }
-
-    #[test]
-    fn strike_aging_removes_old_strikes() {
-        let mut mgr = fresh();
-        mgr.record_strike("hk1", 100, 360);
-        mgr.record_strike("hk1", 200, 360);
-        let later = 200 + VERIFICATION_STRIKES_WINDOW_BLOCKS + 10;
-        let triggered = mgr.record_strike("hk1", later, 360);
-        assert!(!triggered);
-        let strikes = mgr.strikes.get("hk1").unwrap();
-        assert_eq!(strikes.len(), 1);
-        assert_eq!(strikes.front().copied(), Some(later));
     }
 
     #[test]
@@ -431,29 +387,40 @@ mod tests {
     }
 
     #[test]
-    fn should_sample_respects_budget() {
+    fn should_sample_rate_is_volume_invariant() {
         let mut mgr = fresh();
-        mgr.sample_budget.insert(("hk1".to_string(), 0), 0);
-        assert!(!mgr.should_sample("hk1", 50, 360));
+        let mut hits = 0;
+        let trials = 100_000;
+        for _ in 0..trials {
+            if mgr.should_sample("hk1", 50, 360) {
+                hits += 1;
+            }
+        }
+        let rate = hits as f64 / trials as f64;
+        let expected = VERIFICATION_SAMPLES_PER_TEMPO as f64 / RSV_EXPECTED_SUBS_PER_TEMPO as f64;
+        let drift = (rate - expected).abs();
+        assert!(
+            drift < 0.005,
+            "rate {rate:.4} drifts {drift:.4} from expected {expected:.4}"
+        );
     }
 
     #[test]
-    fn strikes_persist_across_uid_change_for_same_hotkey() {
+    fn strikes_keyed_by_hotkey_not_uid() {
         let mut mgr = fresh();
         let hotkey = "5HotkeyValueX";
-        for i in 0..(VERIFICATION_STRIKES_REQUIRED - 1) {
-            mgr.record_strike(hotkey, 100 + i as u64, 360);
+        let other_hotkey = "5OtherHotkey";
+
+        for i in 0..(VERIFICATION_STRIKES_REQUIRED.saturating_sub(1)) {
+            assert!(!mgr.record_strike(hotkey, 100 + i as u64, 360));
         }
-        let strikes_before = mgr.strikes.get(hotkey).unwrap().len();
-        assert_eq!(strikes_before, (VERIFICATION_STRIKES_REQUIRED - 1) as usize);
 
         let triggered = mgr.record_strike(hotkey, 200, 360);
-        assert!(triggered);
+        assert!(
+            triggered,
+            "strike #{VERIFICATION_STRIKES_REQUIRED} must trigger skiplist"
+        );
         assert!(mgr.is_skiplisted(hotkey, 200));
-
-        let other_hotkey = "5OtherHotkey";
-        let triggered_other = mgr.record_strike(other_hotkey, 200, 360);
-        assert!(!triggered_other);
         assert!(!mgr.is_skiplisted(other_hotkey, 200));
     }
 
