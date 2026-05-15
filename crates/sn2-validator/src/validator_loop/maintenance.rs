@@ -261,6 +261,17 @@ impl ValidatorLoop {
         self.score_manager.sync_uids(&uids);
         self.rsv
             .prune_expired(self.current_block, self.blocks_per_tempo);
+        let blacklist_before = self.reconnect_blacklist.len();
+        self.reconnect_blacklist
+            .retain(|_, until| self.current_block < *until);
+        let blacklist_after = self.reconnect_blacklist.len();
+        if blacklist_before != blacklist_after {
+            info!(
+                expired = blacklist_before - blacklist_after,
+                remaining = blacklist_after,
+                "reconnect_blacklist pruned"
+            );
+        }
 
         let mut axon_count = 0usize;
         for n in &self.config.metagraph.neurons {
@@ -438,9 +449,17 @@ impl ValidatorLoop {
             .iter()
             .copied()
             .filter(|uid| {
-                self.uid_hotkeys
-                    .get(uid)
-                    .is_some_and(|hk| !hk.is_empty() && self.rsv.is_skiplisted(hk, current_block))
+                self.uid_hotkeys.get(uid).is_some_and(|hk| {
+                    if hk.is_empty() {
+                        return false;
+                    }
+                    if self.rsv.is_skiplisted(hk, current_block) {
+                        return true;
+                    }
+                    self.reconnect_blacklist
+                        .get(hk)
+                        .is_some_and(|&until| current_block < until)
+                })
             })
             .collect();
         let coldstart: HashSet<u16> = uids
