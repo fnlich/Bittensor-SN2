@@ -93,6 +93,11 @@ pub struct IncrementalRunManager {
     evicted: BoundedFifoSet<String>,
     tile_counters: HashMap<(String, String), TileCounter>,
     verified_tile_counts: HashMap<(String, String), usize>,
+    // Slices marked failed without ever being dispatched (e.g. previously
+    // disabled, or rejected by preflight). Tracked per run so the run-wide
+    // failure guard in finalize_combined_run can distinguish "no slice was
+    // attempted" from "every attempted slice failed".
+    skipped_slices: HashMap<String, HashSet<String>>,
 }
 
 impl Default for IncrementalRunManager {
@@ -102,6 +107,7 @@ impl Default for IncrementalRunManager {
             evicted: BoundedFifoSet::new(EVICTED_CAP),
             tile_counters: HashMap::new(),
             verified_tile_counts: HashMap::new(),
+            skipped_slices: HashMap::new(),
         }
     }
 }
@@ -390,6 +396,36 @@ impl IncrementalRunManager {
             .unwrap_or(0)
     }
 
+    /// Record that a slice was marked failed without ever being dispatched.
+    /// Used by the run-wide failure guard in finalize_combined_run to avoid
+    /// conflating deterministic skips (already-disabled slices, preflight
+    /// rejections) with the "every attempted slice failed" signal that
+    /// triggers the disable-list write-suppression.
+    pub fn note_slice_skipped(&mut self, run_uid: &str, slice_id: &str) {
+        self.skipped_slices
+            .entry(run_uid.to_string())
+            .or_default()
+            .insert(slice_id.to_string());
+    }
+
+    pub fn skipped_slice_count(&self, run_uid: &str) -> usize {
+        self.skipped_slices
+            .get(run_uid)
+            .map(HashSet::len)
+            .unwrap_or(0)
+    }
+
+    /// Returns true when the slice was marked failed without ever being
+    /// dispatched in this run (already-disabled, preflight rejection, etc.).
+    /// finalize_combined_run uses this to keep skipped slices out of the
+    /// disable-list write — they were never attempted, so resetting their
+    /// disabled_at block would defeat the rehab cooldown.
+    pub fn is_slice_skipped(&self, run_uid: &str, slice_id: &str) -> bool {
+        self.skipped_slices
+            .get(run_uid)
+            .is_some_and(|s| s.contains(slice_id))
+    }
+
     pub fn is_run_complete(&self, run_uid: &str) -> bool {
         self.runs
             .get(run_uid)
@@ -414,6 +450,7 @@ impl IncrementalRunManager {
         self.tile_counters.retain(|(uid, _), _| uid != run_uid);
         self.verified_tile_counts
             .retain(|(uid, _), _| uid != run_uid);
+        self.skipped_slices.remove(run_uid);
         self.runs.remove(run_uid)
     }
 
@@ -447,6 +484,8 @@ impl IncrementalRunManager {
             .retain(|(run_uid, _), _| !evict_set.contains(run_uid.as_str()));
         self.verified_tile_counts
             .retain(|(run_uid, _), _| !evict_set.contains(run_uid.as_str()));
+        self.skipped_slices
+            .retain(|run_uid, _| !evict_set.contains(run_uid.as_str()));
         for uid in to_remove.iter() {
             self.runs.remove(uid);
             self.evicted.insert(uid.clone());
@@ -470,6 +509,8 @@ impl IncrementalRunManager {
             .retain(|(run_uid, _), _| !stale_set.contains(run_uid.as_str()));
         self.verified_tile_counts
             .retain(|(run_uid, _), _| !stale_set.contains(run_uid.as_str()));
+        self.skipped_slices
+            .retain(|run_uid, _| !stale_set.contains(run_uid.as_str()));
         for uid in stale.iter() {
             self.runs.remove(uid);
             self.evicted.insert(uid.clone());
@@ -571,6 +612,45 @@ mod tests {
             matches!(result, OutputConsistency::Consistent { .. }),
             "near-zero values should not trigger false positives, got {result:?}"
         );
+    }
+
+    #[test]
+    fn is_slice_skipped_false_before_noting() {
+        let mgr = make_manager_with_run("run-1");
+        assert!(!mgr.is_slice_skipped("run-1", "slice_a"));
+    }
+
+    #[test]
+    fn is_slice_skipped_true_after_noting() {
+        let mut mgr = make_manager_with_run("run-1");
+        mgr.note_slice_skipped("run-1", "slice_a");
+        assert!(mgr.is_slice_skipped("run-1", "slice_a"));
+        assert!(!mgr.is_slice_skipped("run-1", "slice_b"));
+    }
+
+    #[test]
+    fn is_slice_skipped_scoped_to_run_uid() {
+        let mut mgr = make_manager_with_run("run-1");
+        mgr.start_run(
+            "run-2".to_string(),
+            "test-circuit".to_string(),
+            "test".to_string(),
+            RunSource::Benchmark,
+            None,
+            None,
+        );
+        mgr.note_slice_skipped("run-1", "slice_a");
+        assert!(mgr.is_slice_skipped("run-1", "slice_a"));
+        assert!(!mgr.is_slice_skipped("run-2", "slice_a"));
+    }
+
+    #[test]
+    fn skipped_slices_cleared_on_run_removal() {
+        let mut mgr = make_manager_with_run("run-1");
+        mgr.note_slice_skipped("run-1", "slice_a");
+        mgr.remove_run("run-1");
+        assert!(!mgr.is_slice_skipped("run-1", "slice_a"));
+        assert_eq!(mgr.skipped_slice_count("run-1"), 0);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -9,6 +9,13 @@ use tracing::{info, warn};
 
 use super::ValidatorLoop;
 use crate::relay::DsperseSubmission;
+
+/// Number of blocks before a slice in `disabled_slices` is reconsidered for
+/// dispatch. Roughly one tempo on subtensor (~12s blocks). Picked so that a
+/// transient network or chain event that synchronously fails every slice
+/// (e.g. a chain RPC reconnect storm) self-heals within the next epoch
+/// rather than persisting until the validator is restarted.
+const DISABLED_SLICE_REHAB_BLOCKS: u64 = 360;
 
 enum ExpectedInputs {
     NoMetadata,
@@ -440,7 +447,16 @@ impl ValidatorLoop {
         };
 
         let work_items: Vec<_> = {
-            let disabled = self.disabled_slices.get(&circuit.id).cloned();
+            let disabled: Option<HashSet<String>> =
+                self.disabled_slices.get(&circuit.id).map(|m| {
+                    m.iter()
+                        .filter(|(_, &disabled_at)| {
+                            self.current_block.saturating_sub(disabled_at)
+                                < DISABLED_SLICE_REHAB_BLOCKS
+                        })
+                        .map(|(slice_id, _)| slice_id.clone())
+                        .collect()
+                });
             match disabled {
                 Some(disabled) if !disabled.is_empty() => {
                     let (kept, skipped): (Vec<_>, Vec<_>) = work_items
@@ -448,6 +464,7 @@ impl ValidatorLoop {
                         .partition(|w| !disabled.contains(&w.slice_id));
                     for work in &skipped {
                         self.run_manager.mark_slice_failed(run_uid, &work.slice_id);
+                        self.run_manager.note_slice_skipped(run_uid, &work.slice_id);
                     }
                     if !skipped.is_empty() {
                         info!(
@@ -487,6 +504,7 @@ impl ValidatorLoop {
         };
         for slice_id in &preflight_failed {
             self.run_manager.mark_slice_failed(run_uid, slice_id);
+            self.run_manager.note_slice_skipped(run_uid, slice_id);
         }
         if unsatisfiable > 0 {
             info!(
@@ -790,18 +808,53 @@ impl ValidatorLoop {
             .map(str::to_string)
         {
             let (_, _, slice_tiles) = self.run_manager.slice_tile_counts(run_uid);
+            let total_slices = slice_tiles.len();
+            // Candidates for the disable-list write are slices that were
+            // actually attempted in this run, returned without producing a
+            // verified tile, and ended up marked failed. Slices that were
+            // marked failed via the skip path (already-disabled, preflight
+            // rejected) are excluded here so that the disabled_at clock for
+            // already-disabled slices is not re-stamped to current_block on
+            // every subsequent run. Re-stamping would defeat the
+            // DISABLED_SLICE_REHAB_BLOCKS cooldown — a slice that ever
+            // landed in disabled_slices would never age out because each
+            // run would push its disabled_at forward.
             let candidates: Vec<String> = slice_tiles
                 .into_keys()
                 .filter(|slice_id| {
-                    self.run_manager.is_slice_failed(run_uid, slice_id)
+                    !self.run_manager.is_slice_skipped(run_uid, slice_id)
+                        && self.run_manager.is_slice_failed(run_uid, slice_id)
                         && self.run_manager.verified_tile_count(run_uid, slice_id) == 0
                 })
                 .collect();
-            if !candidates.is_empty() {
+            // The disable-list write is suppressed only when at least one
+            // slice was actually attempted and every attempted slice failed
+            // with zero verified tiles. That signal is characteristic of a
+            // validator-side network or chain event (mass QUIC reconnect,
+            // RPC stall) and would otherwise trap the validator into a
+            // permanent no-dispatch loop. Slices that never reached the
+            // miner — already-disabled entries or preflight rejections —
+            // are tracked via note_slice_skipped at the call sites and
+            // already excluded from the candidates filter above, so
+            // candidates.len() is exactly the attempted-and-failed count.
+            let skipped = self.run_manager.skipped_slice_count(run_uid);
+            let attempted = total_slices.saturating_sub(skipped);
+            let run_wide_failure = attempted > 0 && candidates.len() == attempted;
+            if run_wide_failure {
+                warn!(
+                    run_uid = %run_uid,
+                    circuit_id = %circuit_id,
+                    total_slices,
+                    skipped,
+                    attempted,
+                    "every attempted slice failed with zero verified tiles, treating as run-wide failure and skipping disable-list write"
+                );
+            } else if !candidates.is_empty() {
+                let block = self.current_block;
                 let entry = self.disabled_slices.entry(circuit_id.clone()).or_default();
                 let mut inserted = 0usize;
                 for slice_id in &candidates {
-                    if entry.insert(slice_id.clone()) {
+                    if entry.insert(slice_id.clone(), block).is_none() {
                         inserted += 1;
                     }
                 }
@@ -810,6 +863,7 @@ impl ValidatorLoop {
                         circuit_id = %circuit_id,
                         newly_disabled = inserted,
                         total_disabled_for_circuit = entry.len(),
+                        rehab_blocks = DISABLED_SLICE_REHAB_BLOCKS,
                         "disabled slices with zero verified tiles"
                     );
                 }
