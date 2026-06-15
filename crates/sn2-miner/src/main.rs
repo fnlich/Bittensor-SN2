@@ -113,6 +113,8 @@ async fn main() -> Result<()> {
     )
     .await;
 
+    dsperse.warm_circuit_cache().await;
+
     let handlers = handlers::MinerHandlers::new(dsperse, circuit_store);
     let handlers = std::sync::Arc::new(handlers);
 
@@ -272,6 +274,8 @@ async fn run_loopback(cli: Cli) -> Result<()> {
         cli.circuit_cache_dir.as_deref(),
     )
     .await;
+
+    dsperse.warm_circuit_cache().await;
 
     let handlers = handlers::MinerHandlers::new(dsperse, circuit_store);
     let handlers = std::sync::Arc::new(handlers);

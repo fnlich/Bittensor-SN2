@@ -1,11 +1,13 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use sn2_types::json_tensor::flatten_json_to_f64;
-use tracing::info;
+use tracing::{info, warn};
 
 pub struct DSperseClient {
     cache_dir: PathBuf,
+    backend: Arc<dsperse::backend::jstprove::JstproveBackend>,
 }
 
 fn validate_circuit_id(id: &str) -> Result<()> {
@@ -118,7 +120,73 @@ impl DSperseClient {
                 .to_string(),
         );
         info!(cache_dir = %cache_dir.display(), "initialized DSperseClient");
-        Self { cache_dir }
+        Self {
+            cache_dir,
+            backend: Arc::new(dsperse::backend::jstprove::JstproveBackend::new()),
+        }
+    }
+
+    /// Walk the circuit cache directory and pre-load every circuit bundle into
+    /// the backend's in-memory cache. Subsequent proof requests for any of
+    /// these circuits skip disk I/O entirely and get an Arc::clone of the
+    /// already-parsed bundle.
+    pub async fn warm_circuit_cache(&self) {
+        let cache_dir = self.cache_dir.clone();
+        let backend = Arc::clone(&self.backend);
+        tokio::task::spawn_blocking(move || {
+            let model_entries = match std::fs::read_dir(&cache_dir) {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(error = %e, "warm_circuit_cache: could not read cache dir");
+                    return;
+                }
+            };
+            let mut loaded = 0usize;
+            let mut errors = 0usize;
+            for model_entry in model_entries.flatten() {
+                let model_path = model_entry.path();
+                if !model_path.is_dir() {
+                    continue;
+                }
+                if !model_entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("model_")
+                {
+                    continue;
+                }
+                let slices_dir = model_path.join("slices");
+                if !slices_dir.is_dir() {
+                    continue;
+                }
+                let slice_entries = match std::fs::read_dir(&slices_dir) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                for slice_entry in slice_entries.flatten() {
+                    let bundle_path = slice_entry
+                        .path()
+                        .join("jstprove")
+                        .join("circuit.bundle");
+                    if !bundle_path.is_dir() {
+                        continue;
+                    }
+                    match backend.load_bundle_cached(&bundle_path) {
+                        Ok(_) => {
+                            loaded += 1;
+                            info!(path = %bundle_path.display(), "warmed circuit bundle");
+                        }
+                        Err(e) => {
+                            errors += 1;
+                            warn!(path = %bundle_path.display(), error = %e, "failed to warm circuit bundle");
+                        }
+                    }
+                }
+            }
+            info!(loaded, errors, "circuit cache warm complete");
+        })
+        .await
+        .ok();
     }
 
     pub fn cache_dir(&self) -> &Path {
@@ -196,10 +264,10 @@ impl DSperseClient {
         );
 
         let inputs_clone = inputs.clone();
+        let backend = Arc::clone(&self.backend);
 
         tokio::task::spawn_blocking(move || -> Result<ProveArtifacts> {
             let inputs_bytes = rmp_serde::to_vec_named(&inputs_clone)?;
-            let backend = dsperse::backend::jstprove::JstproveBackend::new();
 
             let params = backend
                 .load_params(&circuit_path)
@@ -258,6 +326,7 @@ impl DSperseClient {
         );
 
         let input_data = extract_input_json(inputs).clone();
+        let backend = Arc::clone(&self.backend);
 
         tokio::task::spawn_blocking(move || -> Result<ProveArtifacts> {
             let input_flat = flatten_json_to_f64(&input_data);
@@ -266,7 +335,6 @@ impl DSperseClient {
                 "invalid input tensor: flattened input is empty"
             );
 
-            let backend = dsperse::backend::jstprove::JstproveBackend::new();
             let params = backend
                 .load_params(&circuit_path)
                 .map_err(|e| anyhow::anyhow!("loading circuit params: {e}"))?;
