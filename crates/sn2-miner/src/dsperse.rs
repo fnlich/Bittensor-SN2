@@ -271,11 +271,11 @@ impl DSperseClient {
                 .load_params(&circuit_path)
                 .map_err(|e| anyhow::anyhow!("loading circuit params: {e}"))?;
             let inits = match params.as_ref() {
-                Some(p) if p.weights_as_inputs => {
+                Some(p) => {
                     dsperse::pipeline::extract_onnx_initializers(&onnx_path, p)
                         .map_err(|e| anyhow::anyhow!("extracting initializers: {e}"))?
                 }
-                _ => Vec::new(),
+                None => Vec::new(),
             };
 
             let witness_bytes = backend
